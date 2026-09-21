@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dst-ip-join"
+version = "1.0.0"
+description = "饥荒联机版 IP 联机助手：自动配置端口映射与防火墙，生成可分享的直连地址"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "PyQt6>=6.6",
+]
+
+[project.scripts]
+dst-ip-join = "cli:main"
+dst-ip-join-gui = "app:main"
+
+[tool.setuptools]
+packages = ["dst_ip_join"]
+py-modules = ["app", "cli", "main"]
+
+[tool.ruff.lint]
+# 刻意保留现有代码写法（2026-09-21），关闭当前命中的一批风格/健壮性提示：
+ignore = [
+    "BLE001",  # 宽泛 except Exception —— ctypes/Win32 调用刻意静默降级，属防御式设计
+    "S110",    # try-except-pass —— 同上
+    "S112",    # try-except-continue —— 同上
+    "UP009",   # 保留 # -*- coding: utf-8 -*- 声明
+    "PIE810",  # 多个 startswith 不合并为元组 —— 保持现状写法
+    "DTZ005",  # datetime.now() 不带时区 —— 本地时间用途
+    "F401",    # 未使用的导入
+    "I001",    # 导入排序
+    "ISC004",  # 集合字面量里的隐式字符串拼接
+    "PLW1510", # subprocess.run 未显式传 check
+    "RUF059",  # 解包后未使用的变量
+    "RUF100",  # 未使用的 noqa 注释
+    "UP041",   # TimeoutError 别名建议
+]
