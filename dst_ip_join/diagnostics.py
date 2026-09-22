@@ -235,10 +235,7 @@ def _step_ports(report: Report, reporter: Reporter, ports: list[int] | None) -> 
         )
 
     report.target_ports = report.detected_ports or list(config.DEFAULT_PORTS)
-    if config.DEFAULT_MASTER_PORT in report.target_ports:
-        report.master_port = config.DEFAULT_MASTER_PORT
-    else:
-        report.master_port = min(report.target_ports)
+    report.master_port = config.pick_master_port(report.target_ports)
 
 
 def _step_local_address(report: Report, reporter: Reporter) -> None:

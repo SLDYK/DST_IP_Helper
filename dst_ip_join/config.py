@@ -34,6 +34,21 @@ DEFAULT_PORTS = (DEFAULT_MASTER_PORT, DEFAULT_CAVES_PORT)
 # Windows 默认的动态端口起始值；低于它的 0.0.0.0 绑定才可能是游戏监听口。
 EPHEMERAL_PORT_START = 49152
 
+
+def pick_master_port(ports) -> int:
+    """从一组监听端口里挑出**主世界**（Master 分片）端口。
+
+    注意不能用 ``min()``：DST 里主世界默认 10999、洞穴（Caves）默认 10998，
+    取最小反而会选到**洞穴**端口，而客户端是连不进洞穴分片的。
+    所以优先认 10999，只有在列表里没有它时才退而求其次取最小值。
+    """
+    ports = list(ports)
+    if not ports:
+        return DEFAULT_MASTER_PORT
+    if DEFAULT_MASTER_PORT in ports:
+        return DEFAULT_MASTER_PORT
+    return min(ports)
+
 # 防火墙规则名前缀（删除自己加的规则时靠它识别，不会误删别人的）
 FIREWALL_RULE_PREFIX = "DST-IP-Join"
 UPNP_MAPPING_DESC_PREFIX = "DST-IP-Join"

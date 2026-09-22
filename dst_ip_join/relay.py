@@ -816,14 +816,21 @@ def encode_host_code(
     addresses: list[str],
     base_port: int,
     game_ports: list[int],
+    master_port: int,
     session: str,
 ) -> str:
-    """打包主机码。addresses 按优先级排序（全局 IPv6 在前）。"""
+    """打包主机码。addresses 按优先级排序（全局 IPv6 在前）。
+
+    ``master_port`` 是**主世界分片**的游戏端口，必须由主机显式给出：
+    加入方看到一串游戏端口时无法自行判断哪个是主世界（DST 默认主世界 10999、
+    洞穴 10998，取最小会选到洞穴，而客户端连不进洞穴分片）。
+    """
     payload = {
         "v": CODE_VERSION,
         "addr": addresses,
         "base": base_port,
         "maps": [[base_port + i, p] for i, p in enumerate(game_ports)],
+        "master": master_port,
         "sid": session,
     }
     return CODE_HOST_PREFIX + _b64url_encode(
@@ -859,7 +866,9 @@ def _decode_payload(code: str, prefix: str) -> dict:
 
 
 def decode_host_code(code: str) -> dict:
-    """解析主机码 → {addresses, base_port, maps[(relay_port, game_port)], session}。"""
+    """解析主机码 →
+    ``{addresses, base_port, maps[(relay_port, game_port)], master_port, session}``。
+    """
     data = _decode_payload(code, CODE_HOST_PREFIX)
     try:
         addresses = [str(a) for a in data["addr"]]
@@ -872,10 +881,22 @@ def decode_host_code(code: str) -> dict:
         raise ValueError("主机码里没有地址")
     if not maps:
         raise ValueError("主机码里没有端口映射")
+
+    game_ports = [g for _, g in maps]
+    try:
+        master = int(data["master"])
+    except (KeyError, TypeError, ValueError):
+        master = 0
+    if master not in game_ports:
+        # 只有「不带 master 字段」的旧版主机码才走到这里。
+        # 只能按最小端口猜（有洞穴时可能猜成 10998，请双方都用新版）。
+        master = min(game_ports)
+
     return {
         "addresses": addresses,
         "base_port": base,
         "maps": maps,
+        "master_port": master,
         "session": session,
     }
 

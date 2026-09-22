@@ -10,6 +10,7 @@ ctypes 调 Win32 最容易在「64 位句柄被截断」和「网络字节序换
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -22,7 +23,7 @@ if sys.platform != "win32":
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dst_ip_join import firewall, netinfo, upnp, winproc  # noqa: E402
+from dst_ip_join import config, firewall, netinfo, relay, upnp, winproc  # noqa: E402
 
 PASSED = 0
 FAILED = 0
@@ -357,8 +358,6 @@ print("\n== 12. UDP 中继（纯转发，不解析协议）==")
 import threading  # noqa: E402
 import time  # noqa: E402
 
-from dst_ip_join import relay  # noqa: E402
-
 check(
     "解析 IPv4 端点",
     relay.parse_endpoint("1.2.3.4:10999") == ("1.2.3.4", 10999),
@@ -394,6 +393,58 @@ check("extract_addresses 提取带端口的 IPv4",
       "192.168.1.100" in extracted and "10.0.0.5" in extracted, str(extracted))
 extracted = relay.extract_addresses("回环 ::1 与链路本地 fe80::1 不该出现")
 check("extract_addresses 忽略回环/链路本地", extracted == [], str(extracted))
+
+# 主世界端口选择：绝不能用 min()。
+# DST 主世界默认 10999、洞穴 10998，取最小会选到洞穴，而客户端连不进洞穴分片。
+check("主世界端口选 10999，而不是最小的 10998",
+      config.pick_master_port([10998, 10999]) == 10999,
+      f"min() 会得 {min([10998, 10999])}，选到洞穴")
+check("只有洞穴时退回最小值", config.pick_master_port([10998]) == 10998)
+check("端口改了也能选出结果", config.pick_master_port([20000, 30000]) == 20000)
+check("空端口列表不报错", config.pick_master_port([]) == config.DEFAULT_MASTER_PORT)
+
+# 主机码必须携带主世界端口（加入方无法自行判断）。
+# 旧版码没有该字段，只能退回 min() —— 这是兼容分支，不该出现在新码里。
+_hc_session = relay.make_session_token()
+_hc_new = relay.encode_host_code(
+    ["2409:8a60:cc40::1"], 20000, [10998, 10999], 10999, _hc_session
+)
+_hc_info = relay.decode_host_code(_hc_new)
+check("主机码往返带回主世界端口 10999",
+      _hc_info["master_port"] == 10999, str(_hc_info["master_port"]))
+check("主机码仍带回完整的端口映射",
+      sorted(g for _, g in _hc_info["maps"]) == [10998, 10999], str(_hc_info["maps"]))
+check("主机码仍带回校验值", _hc_info["session"] == _hc_session)
+
+_hc_old = relay.CODE_HOST_PREFIX + relay._b64url_encode(
+    json.dumps({
+        "v": relay.CODE_VERSION,
+        "addr": ["2409:8a60:cc40::1"],
+        "base": 20000,
+        "maps": [[20000, 10998], [20001, 10999]],
+        "sid": _hc_session,
+    }, separators=(",", ":")).encode("utf-8")
+)
+_hc_old_info = relay.decode_host_code(_hc_old)
+check("旧版主机码（无 master 字段）能解析且不报错",
+      bool(_hc_old_info["maps"]), str(_hc_old_info.get("master_port")))
+check("伪装成主世界端口的垃圾值被忽略",
+      relay.decode_host_code(relay.CODE_HOST_PREFIX + relay._b64url_encode(
+          json.dumps({
+              "v": relay.CODE_VERSION,
+              "addr": ["2409:8a60:cc40::1"],
+              "base": 20000,
+              "maps": [[20000, 10998], [20001, 10999]],
+              "master": 999999,
+              "sid": _hc_session,
+          }, separators=(",", ":")).encode("utf-8")
+      ))["master_port"] == 10998)
+
+# 加入方要为每个游戏端口都绑一条回环规则（主世界 + 洞穴都要通）
+_guest_rules = relay.build_guest_rules(_hc_info)
+check("加入方为每个游戏端口都生成回环规则",
+      sorted(r[0] for r in _guest_rules) == ["127.0.0.1:10998", "127.0.0.1:10999"],
+      str(_guest_rules))
 
 # 剪贴板读回（主机端「从剪贴板导入白名单」依赖它）
 clip_marker = "SELFTEST-CLIP-2409:8a60::99"

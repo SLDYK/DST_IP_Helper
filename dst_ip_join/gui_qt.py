@@ -807,14 +807,18 @@ class MainWindow(QMainWindow):
             return
         if not self._session:
             self._session = relay.make_session_token()
+        # 主世界端口必须写进主机码：加入方看端口列表无法分辨哪个是主世界。
+        # DST 默认主世界 10999、洞穴 10998，若按最小端口取会拿到洞穴，
+        # 而客户端是连不进洞穴分片的。
+        master = config.pick_master_port(ports)
         code = relay.encode_host_code(
-            addresses, relay.DEFAULT_RELAY_BASE, sorted(ports), self._session
+            addresses, relay.DEFAULT_RELAY_BASE, sorted(ports), master, self._session
         )
         self.host_code_view.setText(code)
         self.btn_host_code_copy.setEnabled(True)
         self.host_status_label.setText(
             f"中继端口 {relay.DEFAULT_RELAY_BASE} 起，共 {len(ports)} 条映射；"
-            f"校验 {self._session}"
+            f"主世界 {master}；校验 {self._session}"
         )
 
     def regen_host_code(self) -> None:
@@ -1017,14 +1021,19 @@ class MainWindow(QMainWindow):
 
     def _after_relay_started(self) -> None:
         if not self.rb_host.isChecked() and self._host_info:
-            # 加入方：生成游戏内连接指令（主世界端口 = 最小的游戏端口）
-            game_ports = [g for _, g in self._host_info["maps"]]
-            master = min(game_ports)
+            # 加入方：生成游戏内连接指令。
+            # 必须连**主世界**端口（主机在主机码里告知），不能取最小端口 ——
+            # DST 默认主世界 10999、洞穴 10998，连洞穴端口进不去。
+            master = self._host_info["master_port"]
             cmd = f'c_connect("127.0.0.1", {master})'
             self.join_cmd_view.setText(cmd)
             self.btn_join_cmd_copy.setEnabled(True)
+            local_ports = "、".join(
+                str(g) for _, g in sorted(self._host_info["maps"], key=lambda m: m[1])
+            )
             self.join_status_label.setText(
-                f"已连接主机的 {len(self._host_info['maps'])} 条映射；"
+                f"已连接主机的 {len(self._host_info['maps'])} 条映射"
+                f"（本地监听 {local_ports}，主世界 {master}）；"
                 "在饥荒控制台粘贴上面指令即可加入"
             )
 
