@@ -44,111 +44,135 @@ STYLE = """
 * {
     font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
     font-size: 13px;
-    color: #e6e8eb;
+    color: #1f2328;
 }
-QMainWindow, QWidget#root { background: #16181d; }
+QMainWindow, QWidget#root { background: #f4f5f7; }
 
 /* ---------- 标题区 ---------- */
-QLabel#appTitle { font-size: 19px; font-weight: 700; color: #f2f4f7; }
+QLabel#appTitle { font-size: 19px; font-weight: 700; color: #1f2328; }
 QLabel#adminBadge { padding: 3px 10px; border-radius: 9px; font-size: 12px; }
-QLabel#adminBadge[admin="1"] { background: #1e3a28; color: #7fd693; }
-QLabel#adminBadge[admin="0"] { background: #3d3220; color: #e5b567; }
+QLabel#adminBadge[admin="1"] { background: #dafbe1; color: #1a7f37; }
+QLabel#adminBadge[admin="0"] { background: #fff8c5; color: #9a6700; }
 
 /* ---------- 卡片 ---------- */
 QFrame#card {
-    background: #1f2229;
-    border: 1px solid #2c313a;
+    background: #ffffff;
+    border: 1px solid #e1e4e8;
     border-radius: 10px;
 }
-QLabel#cardTitle { color: #8b93a1; font-size: 12px; font-weight: 600; }
+QLabel#cardTitle { color: #6b7280; font-size: 12px; font-weight: 600; }
 
 /* ---------- 检测项 ---------- */
 QLabel#checkIcon { font-size: 14px; font-weight: 700; }
-QLabel#checkTitle { font-weight: 600; color: #d3d7dd; }
-QLabel#checkDetail { color: #8b93a1; }
-QLabel#emptyHint { color: #5b626e; padding: 18px; }
+QLabel#checkTitle { font-weight: 600; color: #24292f; }
+QLabel#checkDetail { color: #6b7280; }
 
 /* ---------- 地址展示 ---------- */
 QLineEdit#addressView {
-    background: #12151a;
-    border: 1px solid #2c313a;
+    background: #f6f8fa;
+    border: 1px solid #d8dee4;
     border-radius: 8px;
     padding: 14px;
     font-family: Consolas, "Cascadia Mono", monospace;
     font-size: 22px;
     font-weight: 700;
-    color: #6cb6ff;
-    selection-background-color: #2d5a88;
+    color: #0969da;
+    selection-background-color: #b6dcff;
 }
 QLineEdit#commandView {
-    background: #12151a;
-    border: 1px solid #2c313a;
+    background: #f6f8fa;
+    border: 1px solid #d8dee4;
     border-radius: 6px;
     padding: 7px 10px;
     font-family: Consolas, "Cascadia Mono", monospace;
     font-size: 14px;
-    color: #8fd6a8;
-    selection-background-color: #2d5a88;
+    color: #1a7f37;
+    selection-background-color: #b6dcff;
 }
 
 /* ---------- 按钮 ---------- */
 QPushButton {
-    background: #2a2f38;
-    border: 1px solid #3a4150;
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
     border-radius: 7px;
     padding: 8px 16px;
 }
-QPushButton:hover { background: #343b47; border-color: #4a5468; }
-QPushButton:pressed { background: #22262e; }
-QPushButton:disabled { background: #22252b; color: #5b626e; border-color: #2c313a; }
+QPushButton:hover { background: #eef1f4; border-color: #b9c0c8; }
+QPushButton:pressed { background: #e4e8ec; }
+QPushButton:disabled { background: #f2f3f5; color: #a8b0b8; border-color: #e1e4e8; }
 QPushButton#primary {
-    background: #2d6cdf;
-    border-color: #2d6cdf;
+    background: #1f6feb;
+    border-color: #1f6feb;
     color: #ffffff;
     font-weight: 600;
 }
-QPushButton#primary:hover { background: #3d7bec; border-color: #3d7bec; }
-QPushButton#primary:pressed { background: #2459b8; }
-QPushButton#primary:disabled { background: #2a3850; color: #7a8699; border-color: #2a3850; }
-QPushButton#danger:hover { border-color: #a4474d; color: #e89090; }
+QPushButton#primary:hover { background: #3b82f6; border-color: #3b82f6; }
+QPushButton#primary:pressed { background: #1a5fd0; }
+QPushButton#primary:disabled { background: #a8c7fa; color: #ffffff; border-color: #a8c7fa; }
+QPushButton#danger:hover { border-color: #cf222e; color: #cf222e; }
 
 /* ---------- 输入 ---------- */
 QLineEdit#portInput {
-    background: #12151a;
-    border: 1px solid #2c313a;
+    background: #ffffff;
+    border: 1px solid #d0d7de;
     border-radius: 6px;
     padding: 6px 10px;
 }
-QLineEdit#portInput:focus { border-color: #2d6cdf; }
+QLineEdit#portInput:focus { border-color: #0969da; }
 QCheckBox { spacing: 6px; }
 QCheckBox::indicator {
     width: 15px; height: 15px; border-radius: 4px;
-    border: 1px solid #4a5468; background: #12151a;
+    border: 1px solid #b9c0c8; background: #ffffff;
 }
-QCheckBox::indicator:checked { background: #2d6cdf; border-color: #2d6cdf; }
+QCheckBox::indicator:checked { background: #0969da; border-color: #0969da; }
 
 /* ---------- 日志 ---------- */
 QPlainTextEdit#logView {
-    background: #101216;
-    border: 1px solid #2c313a;
+    background: #ffffff;
+    border: 1px solid #e1e4e8;
     border-radius: 8px;
     font-family: Consolas, "Cascadia Mono", monospace;
     font-size: 12px;
-    color: #b9c0ca;
+    color: #24292f;
     padding: 6px;
-    selection-background-color: #2d5a88;
+    selection-background-color: #b6dcff;
 }
 
 /* ---------- 进度条与状态栏 ---------- */
 QProgressBar {
-    background: #12151a;
-    border: 1px solid #2c313a;
+    background: #eaeef2;
+    border: 1px solid #d0d7de;
     border-radius: 5px;
     height: 10px;
     text-align: center;
 }
-QProgressBar::chunk { background: #2d6cdf; border-radius: 4px; }
-QLabel#statusLabel { color: #8b93a1; }
+QProgressBar::chunk { background: #0969da; border-radius: 4px; }
+QLabel#statusLabel { color: #57606a; }
+
+/* ---------- 标签页 ---------- */
+QTabWidget::pane {
+    border: 1px solid #e1e4e8;
+    border-radius: 8px;
+    background: transparent;
+    top: -1px;
+}
+QTabBar::tab {
+    background: #eaeef2;
+    border: 1px solid #e1e4e8;
+    border-bottom: none;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    padding: 7px 20px;
+    margin-right: 3px;
+    color: #57606a;
+}
+QTabBar::tab:selected {
+    background: #ffffff;
+    border-color: #e1e4e8;
+    color: #1f2328;
+    font-weight: 600;
+}
+QTabBar::tab:hover:!selected { background: #dfe4ea; }
 
 /* ---------- 滚动条 ---------- */
 QScrollArea { border: none; background: transparent; }
@@ -156,22 +180,22 @@ QScrollBar:vertical {
     background: transparent; width: 10px; margin: 2px;
 }
 QScrollBar::handle:vertical {
-    background: #3a4150; border-radius: 5px; min-height: 24px;
+    background: #c9d1d9; border-radius: 5px; min-height: 24px;
 }
-QScrollBar::handle:vertical:hover { background: #4a5468; }
+QScrollBar::handle:vertical:hover { background: #aeb7c0; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
 
-QToolTip { background: #2a2f38; color: #e6e8eb; border: 1px solid #3a4150; padding: 4px 8px; }
+QToolTip { background: #ffffff; color: #24292f; border: 1px solid #c9d1d9; padding: 4px 8px; }
 """
 
 LEVEL_STYLE = {
-    diagnostics.LEVEL_OK: ("✓", "#7fd693"),
-    diagnostics.LEVEL_WARN: ("!", "#e5b567"),
-    diagnostics.LEVEL_FAIL: ("×", "#e57373"),
-    diagnostics.LEVEL_INFO: ("i", "#8b93a1"),
+    diagnostics.LEVEL_OK: ("✓", "#1a7f37"),
+    diagnostics.LEVEL_WARN: ("!", "#9a6700"),
+    diagnostics.LEVEL_FAIL: ("×", "#cf222e"),
+    diagnostics.LEVEL_INFO: ("i", "#57606a"),
 }
-LOG_COLORS = {"OK": "#7fd693", "WARN": "#e5b567", "FAIL": "#e57373", "INFO": "#8b93a1"}
+LOG_COLORS = {"OK": "#1a7f37", "WARN": "#9a6700", "FAIL": "#cf222e", "INFO": "#57606a"}
 LEVEL_LINE_RE = re.compile(r"^\[(OK|WARN|FAIL|INFO)\s*\]")
 
 
@@ -687,7 +711,7 @@ class MainWindow(QMainWindow):
     # 状态刷新（只在主线程）
     # ------------------------------------------------------------------
     def _add_check(self, item: diagnostics.CheckItem) -> None:
-        icon_text, color = LEVEL_STYLE.get(item.level, ("i", "#8b93a1"))
+        icon_text, color = LEVEL_STYLE.get(item.level, ("i", "#57606a"))
 
         row_widget = QWidget()
         row = QHBoxLayout(row_widget)
@@ -722,7 +746,7 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, message: str) -> None:
         match = LEVEL_LINE_RE.match(message)
-        color = LOG_COLORS.get(match.group(1), "#b9c0ca") if match else "#b9c0ca"
+        color = LOG_COLORS.get(match.group(1), "#24292f") if match else "#24292f"
         if not message:
             self.log_view.appendPlainText("")
             return
@@ -1057,7 +1081,7 @@ class MainWindow(QMainWindow):
             self.relay_log_view.appendPlainText("")
             return
         match = LEVEL_LINE_RE.match(message)
-        color = LOG_COLORS.get(match.group(1), "#b9c0ca") if match else "#b9c0ca"
+        color = LOG_COLORS.get(match.group(1), "#24292f") if match else "#24292f"
         escaped = (
             message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         )

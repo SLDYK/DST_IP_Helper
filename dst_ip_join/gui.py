@@ -20,8 +20,9 @@ from . import config, diagnostics, winproc
 
 # 状态图标与配色
 ICONS = {"ok": "✓", "warn": "!", "fail": "×", "info": "i"}
-COLORS = {"ok": "#1a7f37", "warn": "#b26a00", "fail": "#c62828", "info": "#5f6368"}
-LOG_COLORS = {"OK": "#6ec06e", "WARN": "#e0a94a", "FAIL": "#e06c6c", "INFO": "#9aa0a6"}
+COLORS = {"ok": "#1a7f37", "warn": "#9a6700", "fail": "#cf222e", "info": "#57606a"}
+# 浅色（白色）主题：语义色统一用白底可读的深色版，与 PyQt6 界面保持一致
+LOG_COLORS = {"OK": "#1a7f37", "WARN": "#9a6700", "FAIL": "#cf222e", "INFO": "#57606a"}
 
 _LEVEL_LINE_RE = re.compile(r"^\[(OK|WARN|FAIL|INFO)\s*\]")
 
@@ -201,7 +202,7 @@ class DstIpJoinApp:
         ttk.Label(second_row, text="端口：").pack(side="left", padx=(16, 0))
         self.port_var = tk.StringVar()
         ttk.Entry(second_row, textvariable=self.port_var, width=12).pack(side="left")
-        ttk.Label(second_row, text="（留空 = 自动识别）", foreground="#777").pack(
+        ttk.Label(second_row, text="（留空 = 自动识别）", foreground="#57606a").pack(
             side="left", padx=(4, 0)
         )
 
@@ -216,9 +217,9 @@ class DstIpJoinApp:
             wrap="word",
             font=(MONO_FAMILY, 9),
             state="disabled",
-            background="#1e1e1e",
-            foreground="#d4d4d4",
-            insertbackground="#d4d4d4",
+            background="#ffffff",
+            foreground="#24292f",
+            insertbackground="#24292f",
             relief="flat",
             padx=6,
             pady=4,
@@ -230,7 +231,8 @@ class DstIpJoinApp:
 
         for level, color in LOG_COLORS.items():
             self.log_text.tag_configure(level, foreground=color)
-        self.log_text.tag_configure("title", foreground="#e8e8e8")
+        # 默认正文 tag：白底必须用深色，否则几乎不可见
+        self.log_text.tag_configure("title", foreground="#24292f")
 
     def _build_statusbar(self, parent: ttk.Frame) -> None:
         bar = ttk.Frame(parent)
@@ -240,7 +242,7 @@ class DstIpJoinApp:
         self.progress.pack(side="right")
 
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(bar, textvariable=self.status_var, foreground="#444").pack(
+        ttk.Label(bar, textvariable=self.status_var, foreground="#57606a").pack(
             side="left"
         )
 
@@ -273,7 +275,7 @@ class DstIpJoinApp:
         tk.Label(
             self.checks_frame,
             text=ICONS.get(item.level, "i"),
-            fg=COLORS.get(item.level, "#5f6368"),
+            fg=COLORS.get(item.level, "#57606a"),
             font=(FONT_FAMILY, 11, "bold"),
             width=2,
         ).grid(row=row, column=0, sticky="w", pady=1)
@@ -290,7 +292,7 @@ class DstIpJoinApp:
             self.checks_frame,
             text=item.detail,
             anchor="w",
-            foreground="#5f6368",
+            foreground="#57606a",
             wraplength=int(400 * self.scale),
             font=(FONT_FAMILY, 10),
         ).grid(row=row, column=2, sticky="w", pady=1)
@@ -399,7 +401,7 @@ class DstIpJoinApp:
         if report.is_admin:
             self.admin_badge.configure(text="● 管理员模式", fg="#1a7f37")
         else:
-            self.admin_badge.configure(text="● 普通权限", fg="#b26a00")
+            self.admin_badge.configure(text="● 普通权限", fg="#9a6700")
 
         if self.autocopy_var.get() and report.connect_command:
             self.copy_command(quiet=True)

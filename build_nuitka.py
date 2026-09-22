@@ -42,6 +42,45 @@ def read_version() -> str:
     return "1.0.0"
 
 
+def is_locked(path: str) -> bool:
+    """目标文件是否被别的进程占用。
+
+    程序正在运行时点打包，Nuitka 会在最后一步复制 exe 时失败
+    （Permission denied），而那条错误淹没在几百行编译输出里很难发现。
+    所以先查一次，给出明确提示。
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r+b"):
+            return False
+    except OSError:
+        return True
+
+
+def running_process_names() -> list[str]:
+    """当前运行中的同名进程名，用于给用户更具体的提示。"""
+    try:
+        # tasklist 在中文 Windows 上输出 GBK，必须按 ANSI（mbcs）解码，
+        # 否则中文进程名会变成乱码而匹配不上。
+        output = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, check=False,
+            encoding="mbcs", errors="replace",
+        ).stdout
+    except Exception:  # noqa: BLE001 - 拿不到进程名不影响主流程
+        return []
+    names: list[str] = []
+    base = os.path.splitext(os.path.basename(EXE_NAME))[0].lower()
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        name = line.split(",")[0].strip().strip('"')
+        if base in name.lower() and name not in names:
+            names.append(name)
+    return names
+
+
 def build_command(onefile: bool, jobs: int | None) -> list[str]:
     version = read_version()
     # Windows 版本资源需要 4 段数字，1.0.0 -> 1.0.0.0
@@ -112,6 +151,21 @@ def main(argv: list[str] | None = None) -> int:
     command = build_command(onefile, args.jobs or None)
     if not args.keep_output:
         command.insert(-1, "--remove-output")
+
+    # 预检：程序正在运行时目标 exe 会被锁住，Nuitka 到复制那步才报错，
+    # 且错误淹没在编译输出里；不如现在就说清楚。
+    if onefile:
+        target = os.path.join(DIST, EXE_NAME)
+        if is_locked(target):
+            print(f"[ERROR] 目标文件被占用，无法覆盖：{target}")
+            names = running_process_names()
+            if names:
+                print("        检测到正在运行的进程：")
+                for name in names:
+                    print(f"          · {name}")
+            print("        请先关掉程序再重新打包（注意 onefile 会有引导器+子进程两个）。")
+            print(f'        命令行强制结束：taskkill /IM "{os.path.basename(EXE_NAME)}" /F')
+            return 1
 
     print("=" * 72)
     print(f"Nuitka 打包 {APP_NAME} v{read_version()}")
