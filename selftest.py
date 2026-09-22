@@ -363,6 +363,7 @@ else:
                     "join_cmd_view",
                     "btn_join_apply",
                     "btn_join_start",
+                    "btn_join_probe",
                 )
             ),
         )
@@ -738,7 +739,66 @@ check("无匹配存档时 cluster 为 None 但仍可接管",
 
 
 # ==========================================================================
-print("\n== 16. CLI 开服路径（用桩代替真实进程）==")
+print("\n== 16. 连通性探测（区分「包没到」/「被白名单拒」）==")
+
+# 主机端中继：监听 127.0.0.1:PORT，允许 127.0.0.1
+_probe_host_rule = relay.ForwardRule(
+    "127.0.0.1:0", "127.0.0.1:9",  # target 随便；探测包不会转发过去
+    allow=relay.AddressAllowList(["127.0.0.1/32"]),
+)
+_, _probe_port = _probe_host_rule.actual_listen_endpoint()
+_probe_relay = relay.UdpRelay([_probe_host_rule], idle_timeout=0, log=lambda _: None)
+threading.Thread(target=_probe_relay.run, kwargs={"max_seconds": 8}, daemon=True).start()
+time.sleep(0.4)
+
+_r_ok = relay.probe_endpoint("127.0.0.1", _probe_port, timeout=2.0)
+check("白名单内探测返回 ok（路通）", _r_ok["status"] == "ok",
+      f"status={_r_ok['status']} rtt={_r_ok.get('rtt_ms')}")
+_probe_relay.stop()
+
+# 主机端中继：白名单里没有 127.0.0.1 → 应回 denied
+_deny_rule = relay.ForwardRule(
+    "127.0.0.1:0", "127.0.0.1:9",
+    allow=relay.AddressAllowList(["10.99.99.99/32"]),
+)
+_, _deny_port = _deny_rule.actual_listen_endpoint()
+_deny_relay = relay.UdpRelay([_deny_rule], idle_timeout=0, log=lambda _: None)
+threading.Thread(target=_deny_relay.run, kwargs={"max_seconds": 8}, daemon=True).start()
+time.sleep(0.4)
+_r_deny = relay.probe_endpoint("127.0.0.1", _deny_port, timeout=2.0)
+check("白名单外探测返回 denied（包到了但被拒）", _r_deny["status"] == "denied",
+      f"status={_r_deny['status']}")
+_deny_relay.stop()
+
+# 无人监听 → timeout（包到不了）
+_r_to = relay.probe_endpoint("127.0.0.1", 59999, timeout=0.6)
+check("没人听时返回 refused/timeout（路径通但端口没开）",
+      _r_to["status"] in ("refused", "timeout"),
+      f"status={_r_to['status']}")
+
+# 主机码 → 只探主世界那条映射
+_probe_info = {
+    "addresses": ["127.0.0.1"],
+    "maps": [[20000, 10998], [20001, 10999]],
+    "master_port": 10999,
+}
+_probe_relay2_rule = relay.ForwardRule(
+    "127.0.0.1:20001", "127.0.0.1:9",
+    allow=relay.AddressAllowList(["127.0.0.1/32"]),
+)
+_probe_relay2 = relay.UdpRelay([_probe_relay2_rule], idle_timeout=0, log=lambda _: None)
+threading.Thread(target=_probe_relay2.run, kwargs={"max_seconds": 8}, daemon=True).start()
+time.sleep(0.4)
+_results = relay.probe_host_info(_probe_info, timeout=1.5)
+check("probe_host_info 只探主世界那条（20001）",
+      len(_results) == 1 and _results[0]["address"].endswith(":20001"),
+      str([r["address"] for r in _results]))
+check("探测结果有对应的人话说明", bool(relay.describe_probe(_results)))
+_probe_relay2.stop()
+
+
+# ==========================================================================
+print("\n== 17. CLI 开服路径（用桩代替真实进程）==")
 
 # 回归：曾因 `def log` 定义写在 --start-server 块之后，闭包引用未绑定的自由变量，
 # 导致 `cli.py --start-server` 直接 NameError 崩溃。这里用桩跑一遍该代码路径。

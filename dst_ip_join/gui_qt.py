@@ -730,6 +730,12 @@ class MainWindow(QMainWindow):
         self.btn_join_stop.clicked.connect(self.stop_relay)
         self.btn_join_stop.setEnabled(False)
         srow.addWidget(self.btn_join_stop)
+        self.btn_join_probe = QPushButton("测试到主机的连通性")
+        self.btn_join_probe.setToolTip(
+            "向主机中继端口发探测包。能区分「包没到主机」与「到了但被白名单拒」，"
+            "不必先启动中继")
+        self.btn_join_probe.clicked.connect(self.probe_host)
+        srow.addWidget(self.btn_join_probe)
         srow.addStretch(1)
         slay.addLayout(srow)
 
@@ -1409,6 +1415,49 @@ class MainWindow(QMainWindow):
             )
 
     # ---- 启动 / 停止 ----
+    def probe_host(self) -> None:
+        """探测到主机的连通性（不依赖中继是否已启动）。"""
+        info = self._host_info
+        if info is None:
+            text = self.host_code_input.text().strip()
+            if not text:
+                self._notify("warn", "请先粘贴主机发来的 HOST… 码。")
+                return
+            try:
+                info = relay.decode_host_code(text)
+            except ValueError as exc:
+                self._notify("warn", str(exc))
+                return
+            self._host_info = info
+
+        self._append_relay_log("[INFO] 开始连通性测试（向主机中继端口发探测包）…")
+        try:
+            results = relay.probe_host_info(info, timeout=1.5)
+        except OSError as exc:
+            self._append_relay_log(f"[FAIL] 探测出错：{exc}")
+            return
+        if not results:
+            self._append_relay_log("[WARN] 主机码里没有可探测的地址或端口")
+            return
+        for line in relay.describe_probe(results):
+            self._append_relay_log(line)
+
+        statuses = {r["status"] for r in results}
+        if "ok" in statuses:
+            self._append_relay_log("[OK  ] 主机可达，可以启动中继进游戏。")
+            self.join_status_label.setText("连通性：通")
+        elif "denied" in statuses:
+            self._append_relay_log(
+                "[WARN] 包能到主机，但被白名单拒绝 —— "
+                "把你的加入码重新发给主机添加后再试。")
+            self.join_status_label.setText("连通性：被白名单拒绝")
+        else:
+            self._append_relay_log(
+                "[FAIL] 主机无响应。常见原因：主机中继没启动；"
+                "主机 Windows 防火墙未放行中继端口；主机路由器/光猫的"
+                "IPv6 防火墙拦了入站；或主机码里的地址已失效。")
+            self.join_status_label.setText("连通性：不通（包到不了主机）")
+
     def apply_and_start(self) -> None:
         if self.rb_host.isChecked():
             rules, error = self._build_host_rules()
@@ -1417,6 +1466,10 @@ class MainWindow(QMainWindow):
         if rules is None:
             self._notify("warn", error)
             return
+
+        # 先清空日志，再放行防火墙 —— 否则 _auto_firewall 写的
+        # [OK]/[WARN] 结果会被后面的 clear() 抹掉，用户根本看不到到底放行成没成功。
+        self.relay_log_view.clear()
 
         # 主机端：自动放行防火墙（需管理员，失败仅提示）
         if self.rb_host.isChecked():
@@ -1428,7 +1481,6 @@ class MainWindow(QMainWindow):
             thread.stop()
             thread.wait(3000)
 
-        self.relay_log_view.clear()
         self._append_relay_log(f"[INFO] 启动 {len(rules)} 条转发规则")
         for rule in rules:
             self._append_relay_log(

@@ -83,12 +83,45 @@ def main(argv: list[str] | None = None) -> int:
         "--stop-server", action="store_true",
         help="停止当前正在运行的专用服务器（含不是本工具启动的）",
     )
+    parser.add_argument(
+        "--probe", metavar="主机码",
+        help="用 HOST… 码测试到主机的连通性（区分「包没到」与「被白名单拒」）",
+    )
     args = parser.parse_args(argv)
 
     from dst_ip_join import diagnostics, server
 
     def log(message: str) -> None:
         print(message, flush=True)
+
+    # ---- 连通性探测 ---------------------------------------------------------
+    if args.probe:
+        from dst_ip_join import relay as _relay
+        try:
+            info = _relay.decode_host_code(args.probe)
+        except ValueError as exc:
+            print(f"主机码无效：{exc}")
+            return 2
+        print("开始连通性测试（向主机中继端口发探测包）…")
+        results = _relay.probe_host_info(info, timeout=2.0)
+        if not results:
+            print("主机码里没有可探测的地址或端口")
+            return 3
+        for line in _relay.describe_probe(results):
+            print(line)
+        statuses = {r["status"] for r in results}
+        if "ok" in statuses:
+            print("\n结论：主机可达，可以启动中继进游戏。")
+            return 0
+        if "denied" in statuses:
+            print("\n结论：包能到主机，但被白名单拒绝 —— 请把加入码重新发给主机添加。")
+            return 4
+        print("\n结论：主机无响应。常见原因：")
+        print("  · 主机端中继没启动")
+        print("  · 主机 Windows 防火墙未放行中继端口")
+        print("  · 主机路由器/光猫的 IPv6 防火墙拦了入站")
+        print("  · 主机码里的地址已失效")
+        return 5
 
     # ---- 通用化：路径覆盖设置 -------------------------------------------------
     if args.set_paths:

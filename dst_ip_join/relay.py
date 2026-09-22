@@ -52,6 +52,18 @@ BUFFER_SIZE = 65535
 # Windows 上整个 127.0.0.0/8 都指向回环，已实测 127.0.0.99 可正常 bind。
 _LOOPBACK_POOL = [f"127.0.0.{i}" for i in range(2, 255)]
 
+# ---------------------------------------------------------------------------
+# 连通性探测
+# ---------------------------------------------------------------------------
+# 中继收到以 PROBE_MAGIC 开头的包时**自己应答**（不转发给游戏），
+# 用来把两种失败分开：
+#   OK     —— 包到达主机且通过白名单（路是通的）
+#   DENIED —— 包到达主机但被白名单拒绝（地址没加对）
+#   timeout—— 包根本没到主机（防火墙 / 光猫路由 / 地址错）
+PROBE_MAGIC = b"DST-IP-JOIN-PROBE/1 "
+PROBE_REPLY_OK = b"DST-IP-JOIN-PROBE-OK"
+PROBE_REPLY_DENIED = b"DST-IP-JOIN-PROBE-DENIED"
+
 
 # ==========================================================================
 # 地址工具
@@ -486,6 +498,27 @@ class UdpRelay:
             except OSError as exc:
                 self._vlog(f"{rule.listen_text_full} 收包出错：{exc}")
                 return
+
+            # 连通性探测：中继自己回包，不交给游戏进程（游戏不会响应这种包）
+            if data.startswith(PROBE_MAGIC):
+                allowed = rule.allow.allows(remote[0])
+                reply = PROBE_REPLY_OK if allowed else PROBE_REPLY_DENIED
+                try:
+                    rule.listen_sock.sendto(reply, remote)
+                except OSError:
+                    pass
+                self.log(
+                    f"收到连通性探测 {format_endpoint(remote[0], remote[1])}："
+                    + ("已回包（在白名单内）" if allowed else "已回包（不在白名单！）")
+                )
+                self.fire_event(
+                    "probe",
+                    {
+                        "remote": format_endpoint(remote[0], remote[1]),
+                        "allowed": allowed,
+                    },
+                )
+                continue
 
             if not rule.allow.allows(remote[0]):
                 rule.dropped_untrusted += 1
@@ -1041,6 +1074,91 @@ def build_guest_rules(host_info: dict) -> list[tuple[str, str]]:
             (format_endpoint("127.0.0.1", game_port), f"{host_part}:{relay_port}")
         )
     return rules
+
+
+# ---------------------------------------------------------------------------
+# 连通性探测（加入方 -> 主机中继）
+# ---------------------------------------------------------------------------
+
+def probe_endpoint(host: str, port: int, timeout: float = 1.5) -> dict:
+    """向某个中继端口发一个探测包，返回结果字典。
+
+    状态含义：
+      ``ok``      包到达主机且通过白名单（路是通的）
+      ``denied``  包到达主机但**被白名单拒绝**（地址没加对）
+      ``timeout`` 包根本没到主机（防火墙 / 光猫路由 / 地址写错）
+      ``error``   本机发送就失败了
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    result: dict = {
+        "address": format_endpoint(host, port),
+        "status": "timeout",
+        "rtt_ms": None,
+        "detail": "",
+    }
+    try:
+        started = time.monotonic()
+        sock.sendto(PROBE_MAGIC + secrets.token_bytes(4), (host, port))
+        data, _ = sock.recvfrom(256)
+        result["rtt_ms"] = round((time.monotonic() - started) * 1000, 1)
+        if data.startswith(PROBE_REPLY_OK):
+            result["status"] = "ok"
+        elif data.startswith(PROBE_REPLY_DENIED):
+            result["status"] = "denied"
+        else:
+            result["status"] = "unknown"
+    except socket.timeout:
+        result["status"] = "timeout"
+    except OSError as exc:
+        # UDP 收到 ICMP 端口不可达时，Windows 会在后续 recvfrom 报
+        # WSAECONNRESET(10054) / WSAECONNREFUSED(10061)。
+        # 这反而是好消息：**包能到那台机器**，只是那个端口没人监听。
+        if getattr(exc, "winerror", None) in (10054, 10061):
+            result["status"] = "refused"
+        else:
+            result["status"] = "error"
+            result["detail"] = str(exc)
+    finally:
+        sock.close()
+    return result
+
+
+def probe_host_info(host_info: dict, timeout: float = 1.5,
+                    max_addresses: int = 3) -> list[dict]:
+    """对主机码里的每个地址探测**主世界那条映射**的端口。
+
+    只探主世界那一条：能通就说明整条路可用，全探太慢。
+    """
+    addresses = list(host_info.get("addresses") or [])[:max_addresses]
+    maps = list(host_info.get("maps") or [])
+    master = host_info.get("master_port")
+    relay_port = next((rp for rp, gp in maps if gp == master), None)
+    if relay_port is None and maps:
+        relay_port = maps[0][0]
+    if relay_port is None:
+        return []
+    return [probe_endpoint(addr, relay_port, timeout) for addr in addresses]
+
+
+def describe_probe(results: list[dict]) -> list[str]:
+    """把探测结果转成人话。"""
+    label = {
+        "ok": "✅ 通",
+        "denied": "⛔ 包到了主机，但被白名单拒绝（地址没加对）",
+        "refused": "⚠ 包到了那台机器，但端口没人监听（中继没启动？）",
+        "timeout": "❌ 无响应：包没到主机（防火墙 / 光猫路由 / 地址写错）",
+        "unknown": "⚠ 收到非预期回包",
+        "error": "⚠ 本机发送失败",
+    }
+    lines = []
+    for r in results:
+        text = label.get(r["status"], r["status"])
+        extra = f"（{r['rtt_ms']} ms）" if r.get("rtt_ms") else ""
+        detail = f"  {r['detail']}" if r.get("detail") else ""
+        lines.append(f"  {r['address']}  {text}{extra}{detail}")
+    return lines
 
 
 def format_address_report() -> list[str]:
