@@ -971,6 +971,12 @@ def check_relay_readiness(role: str = "host") -> list[tuple[bool, str, str]]:
     v4, _ = list_local_addresses()
     if globals_v6:
         results.append((True, "ok", f"有全局 IPv6：{globals_v6[0]}"))
+        if len(globals_v6) > 1:
+            results.append(
+                (True, "ok",
+                 f"共 {len(globals_v6)} 个全局 IPv6（已全部写进主机码，"
+                 f"朋友会逐个试）")
+            )
     elif role == "host":
         if v4:
             results.append(
@@ -994,6 +1000,185 @@ def check_relay_readiness(role: str = "host") -> list[tuple[bool, str, str]]:
             results.append(
                 (False, "fail", "未识别到饥荒监听端口，请先在游戏里开好世界")
             )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 主机端自检（中继专用：端口、防火墙、自环可达）
+# ---------------------------------------------------------------------------
+
+def _relay_ports_for_check(host_ports: list[int] | None,
+                           count: int = 4) -> list[int]:
+    """按主机规则的实际排布推算出中继要用的端口序列。
+
+    游戏没开（拿不到端口）时按 ``count`` 个估算 —— 中继规则是
+    「一个游戏端口一条」，实测典型是 4 条（主世界 + 洞穴 + 两个 Steam 端口）。
+    """
+    n = len(host_ports) if host_ports else count
+    return [DEFAULT_RELAY_BASE + i for i in range(min(n, count))]
+
+
+def can_bind_port(port: int, host: str = "::") -> tuple[bool, str]:
+    """测试能否在 ``host`` 上绑定该 UDP 端口。
+
+    两点必须与中继实际行为一致，否则结论不可信：
+    1. **不设 ``SO_REUSEADDR``** —— Windows 上它允许两个进程抢绑同一端口，
+       收包分流会变得不可预测。用独占绑定才能测出真实冲突。
+    2. **``IPV6_V6ONLY=1``**（与 ``ForwardRule`` 默认的 ``dual_stack=False`` 一致）。
+       若这里用 0（双栈）去测，而占用方是 1，Windows 会**允许两者共存**，
+       于是明明被占用却报「可用」。
+    """
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    try:
+        if host == "::":
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((host, port))
+        return True, "可用"
+    except OSError as exc:
+        code = getattr(exc, "winerror", None) or exc.errno
+        # 10048 / WSAEADDRINUSE：已被占用
+        if code == 10048:
+            return False, "已被其他程序占用"
+        if code in (10013, 10049):  # 权限/地址不可用
+            return False, f"无法绑定（{exc}）"
+        return False, str(exc)
+    finally:
+        sock.close()
+
+
+def self_loop_probe(port: int, address: str | None = None,
+                    timeout: float = 0.6) -> dict:
+    """从本机经**公网地址**回连自己的中继端口。
+
+    ⚠️ 局限：本机自发自收可能走系统内部优化，**不能证明外部入站可达**。
+    但它能验证很有价值的三件事：端口真的绑上了、防火墙规则对本机也生效、
+    地址与端口这一对是自洽的。
+
+    结果里的 ``denied`` 要当作**好消息**：说明包到达了中继（路径通），
+    只是本机地址不在白名单里 —— 主机自己本来就不需要加入码。
+    """
+    globals_v6 = global_ipv6_addresses()
+    target = address or (globals_v6[0] if globals_v6 else None)
+    if target is None:
+        v4, _ = list_local_addresses()
+        target = v4[0] if v4 else None
+    if target is None:
+        return {"status": "error", "address": "-", "detail": "本机没有任何可用地址"}
+    return probe_endpoint(target, port, timeout=timeout)
+
+
+def check_host_readiness(
+    host_ports: list[int] | None = None,
+    *,
+    session: str = "",
+    join_entries: list[dict] | None = None,
+    loopback: bool = True,
+    loopback_timeout: float = 0.6,
+) -> list[tuple[bool, str, str]]:
+    """主机端中继的**完整自检**（在 ``check_relay_readiness`` 基础上补足）。
+
+    补的三类检查正是「朋友连不上」的高频原因：
+      1. 中继端口能否绑定（被占用 / 权限）
+      2. Windows 防火墙是否已放行这些端口
+      3. 自环可达（经公网地址回连自己）
+    外加加入码与主机码一致性检查。
+    """
+    results = check_relay_readiness("host")
+    ports = _relay_ports_for_check(host_ports)
+
+    # 4. 中继端口能否绑定
+    busy: list[int] = []
+    for port in ports:
+        ok, why = can_bind_port(port)
+        if not ok:
+            busy.append(port)
+        results.append((ok, "ok" if ok else "warn",
+                        f"中继端口 UDP {port}：{why}"))
+    if busy:
+        results.append(
+            (False, "warn",
+             "端口被占用不影响启动（启动时若仍占用会报错），"
+             "但请确认不是另一个中继实例在跑")
+        )
+
+    # 5. Windows 防火墙放行状态
+    try:
+        from . import firewall
+
+        missing = [p for p in ports if not firewall.rule_exists(p)]
+        if not missing:
+            results.append((True, "ok",
+                            f"防火墙已放行：" + "、".join(f"UDP {p}" for p in ports)))
+        else:
+            results.append(
+                (False, "warn",
+                 "防火墙未放行：" + "、".join(f"UDP {p}" for p in missing)
+                 + "（点「确认生效并启动中继」会自动放行，需管理员）")
+            )
+    except Exception as exc:  # noqa: BLE001
+        results.append((False, "warn", f"防火墙状态查询失败：{exc}"))
+
+    # 6. 加入码（白名单）
+    entries = join_entries or []
+    # 注意 allow_entries_from_codes 返回的是**地址字符串列表**，不是条目列表，
+    # 所以这里自己过一遍条目，才能区分「没码」与「码没启用/校验值不匹配」。
+    active = [e for e in entries if e.get("enabled", True)]
+    if session:
+        active = [e for e in active
+                  if not e.get("session") or e["session"] == session]
+    addrs: list[str] = []
+    for e in active:
+        for a in e.get("addresses", []):
+            if a not in addrs:
+                addrs.append(a)
+
+    if not entries:
+        results.append(
+            (False, "warn",
+             "还没有任何加入码：朋友连进来会被全部拒绝。"
+             "请在「第 4 步」粘贴朋友发来的 JOIN… 码")
+        )
+    elif not active:
+        results.append(
+            (False, "warn",
+             f"有 {len(entries)} 个加入码，但没有「启用且校验值匹配」的 —— "
+             "朋友会被拒绝。请检查是否启用，或重新生成主机码")
+        )
+    else:
+        shown = "、".join(addrs[:3]) + ("…" if len(addrs) > 3 else "")
+        results.append(
+            (True, "ok",
+             f"白名单生效：{len(active)} 个加入码，{len(addrs)} 个地址（{shown}）")
+        )
+
+    # 7. 自环可达（经公网地址回连自己的中继端口）
+    if loopback:
+        got = self_loop_probe(ports[0], timeout=loopback_timeout)
+        status = got.get("status")
+        addr = got.get("address", "-")
+        if status == "ok":
+            results.append((True, "ok", f"自环测试：经 {addr} 回连成功"))
+        elif status == "denied":
+            # 主机自己不在白名单里，这是预期行为 —— 关键证明「包能到中继」
+            results.append(
+                (True, "ok",
+                 f"自环测试：经 {addr} 包已到达中继（被白名单拒，属预期 —— "
+                 f"主机自己不需要加入码）")
+            )
+        elif status == "refused":
+            results.append(
+                (False, "warn",
+                 f"自环测试：{addr} 端口没人监听（中继尚未启动，属正常）")
+            )
+        elif status == "timeout":
+            results.append(
+                (False, "warn",
+                 f"自环测试：经 {addr} 无响应 —— 可能被防火墙拦住本机入站，"
+                 f"或该地址不可用")
+            )
+        else:
+            results.append((False, "warn", f"自环测试：{addr} → {status}"))
 
     return results
 

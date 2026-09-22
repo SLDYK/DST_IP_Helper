@@ -285,6 +285,33 @@ class RelayThread(QThread):
         return self.relay.snapshot()
 
 
+class ReadinessThread(QThread):
+    """在后台跑中继就绪自检（含 netsh 与自环探测，都是阻塞 IO）。"""
+
+    done = pyqtSignal(object)   # list[(ok, level, message)]
+
+    def __init__(self, role: str, *, session: str = "",
+                 entries: list[dict] | None = None) -> None:
+        super().__init__()
+        self._role = role
+        self._session = session
+        self._entries = entries or []
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            if self._role == "host":
+                results = relay.check_host_readiness(
+                    relay.detect_dst_ports(),
+                    session=self._session,
+                    join_entries=self._entries,
+                )
+            else:
+                results = relay.check_relay_readiness("join")
+            self.done.emit(results)
+        except Exception:  # noqa: BLE001
+            self.done.emit([(False, "fail", f"自检出错：{traceback.format_exc(limit=1)}")])
+
+
 class ServerThread(QThread):
     """后台扫描存档 / 拉起专用服务器，避免阻塞界面。"""
 
@@ -350,6 +377,7 @@ class MainWindow(QMainWindow):
         self._server_scan_thread: ServerThread | None = None
         self._server_manager = None       # ServerManager 或 AttachedServer
         self._attached_pending = None     # 检测到待接管的 AttachedServer
+        self._readiness_thread: ReadinessThread | None = None
 
         self.setWindowTitle(f"{config.APP_NAME}  v{config.APP_VERSION}")
         self.resize(900, 640)
@@ -1255,8 +1283,31 @@ class MainWindow(QMainWindow):
     # 中继：就绪检测 / 角色 / 码
     # ------------------------------------------------------------------
     def refresh_relay_readiness(self) -> None:
+        """在后台线程跑就绪自检（netsh + 自环探测是阻塞 IO）。"""
+        if _is_offscreen():
+            # 离屏（自动化测试）下不去碰 netsh / 网络探测：既拖慢测试，
+            # 又容易让 QThread 在窗口销毁时仍在运行（仓库里记录过的坑）。
+            self.relay_ready_view.setPlainText("（离屏模式跳过自检）")
+            self._relay_ready = True
+            return
+        if self._readiness_thread is not None and self._readiness_thread.isRunning():
+            return
         role = "host" if self.rb_host.isChecked() else "join"
-        results = relay.check_relay_readiness(role)
+        self.relay_ready_view.setPlainText("检测中…")
+        thread = ReadinessThread(
+            role,
+            session=self._session,
+            entries=relay.load_join_codes(),
+        )
+        thread.done.connect(self._on_readiness_done)
+        thread.finished.connect(self._on_readiness_finished)
+        self._readiness_thread = thread
+        thread.start()
+
+    def _on_readiness_finished(self) -> None:
+        self._readiness_thread = None
+
+    def _on_readiness_done(self, results: list) -> None:
         lines = []
         self._relay_ready = True
         for ok, level, msg in results:
@@ -1265,7 +1316,7 @@ class MainWindow(QMainWindow):
             if level == "fail":
                 self._relay_ready = False
         self.relay_ready_view.setPlainText("\n".join(lines))
-        if role == "host":
+        if self.rb_host.isChecked():
             self._refresh_host_code()
 
     def _on_role_changed(self) -> None:
@@ -1729,6 +1780,12 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._relay_timer.stop()
         self._server_timer.stop()
+        # readiness 自检是短任务（netsh + 一次探测），等它收尾再销毁窗口，
+        # 否则会报 QThread: Destroyed while thread is still running
+        readiness = self._readiness_thread
+        if readiness is not None and readiness.isRunning():
+            readiness.wait(4000)
+            self._readiness_thread = None
         if manager is not None:
             self._server_manager = None
         thread = self.relay_thread

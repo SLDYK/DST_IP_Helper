@@ -798,7 +798,68 @@ _probe_relay2.stop()
 
 
 # ==========================================================================
-print("\n== 17. CLI 开服路径（用桩代替真实进程）==")
+print("\n== 17. 主机端自检（端口 / 防火墙 / 自环）==")
+
+# 端口推算：游戏没开时按典型规模估算
+check("_relay_ports_for_check 空输入按 4 个估算",
+      relay._relay_ports_for_check([]) == [20000, 20001, 20002, 20003],
+      str(relay._relay_ports_for_check([])))
+check("_relay_ports_for_check 按游戏端口数对齐",
+      relay._relay_ports_for_check([10999, 10998]) == [20000, 20001],
+      str(relay._relay_ports_for_check([10999, 10998])))
+
+# 端口可绑定测试：空闲 → 可用；被占用 → 不可用
+_bind_port = 58901
+_ok_free, _why_free = relay.can_bind_port(_bind_port)
+check("空闲端口可绑定", _ok_free, _why_free)
+_holder = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+try:
+    _holder.bind(("::", _bind_port))
+    _ok_busy, _why_busy = relay.can_bind_port(_bind_port)
+    check("被占用端口报告不可用", not _ok_busy, _why_busy)
+    check("被占用时的说明提到占用", "占用" in _why_busy, _why_busy)
+finally:
+    _holder.close()
+
+# 自环探测：本机没有中继在监听该端口 → refused（路径通、端口没人听）
+_loop = relay.self_loop_probe(58902, timeout=0.6)
+check("自环探测在无人监听时返回 refused/timeout/error",
+      _loop["status"] in ("refused", "timeout", "error"),
+      f"status={_loop['status']}")
+
+# 完整自检：必须涵盖「防火墙」「白名单」「自环」这三类关键项
+_res = relay.check_host_readiness([10999, 10998], session="SESS", join_entries=[])
+_text = "\n".join(m for _, _, m in _res)
+check("主机端自检覆盖防火墙项", "防火墙" in _text)
+check("主机端自检覆盖白名单项", "加入码" in _text or "白名单" in _text)
+check("主机端自检覆盖自环项", "自环测试" in _text)
+check("主机端自检覆盖中继端口项", "中继端口" in _text)
+check("无加入码时提示会被拒绝",
+      any(level == "warn" and "加入码" in m for _, level, m in _res))
+
+# 有「启用且 sid 匹配」的加入码时，白名单项应通过
+_active_entries = [{
+    "enabled": True,
+    "session": "SESS",
+    "addresses": ["2409:8a60:cc40::99"],
+    "note": "测试",
+}]
+_res2 = relay.check_host_readiness([10999], session="SESS",
+                                   join_entries=_active_entries, loopback=False)
+check("有生效加入码时白名单项通过",
+      any(level == "ok" and "白名单生效" in m for _, level, m in _res2),
+      "\n".join(m for _, _, m in _res2 if "白名单" in m or "加入码" in m))
+
+# 校验值不匹配时应判为不可用（防止把上一轮的旧码当成有效）
+_stale_entries = [dict(_active_entries[0], session="OLD-SESSION")]
+_res3 = relay.check_host_readiness([10999], session="SESS",
+                                   join_entries=_stale_entries, loopback=False)
+check("校验值不匹配的加入码不算生效",
+      any(level == "warn" and "校验值匹配" in m for _, level, m in _res3))
+
+
+# ==========================================================================
+print("\n== 18. CLI 开服路径（用桩代替真实进程）==")
 
 # 回归：曾因 `def log` 定义写在 --start-server 块之后，闭包引用未绑定的自由变量，
 # 导致 `cli.py --start-server` 直接 NameError 崩溃。这里用桩跑一遍该代码路径。
