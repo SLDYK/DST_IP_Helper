@@ -449,6 +449,51 @@ def set_clipboard_text(text: str) -> bool:
         user32.CloseClipboard()
 
 
+def get_clipboard_text() -> str:
+    """读取 Windows 剪贴板里的文本（CF_UNICODETEXT）；没有文本时返回空串。"""
+    if not IS_WINDOWS:
+        return ""
+
+    user32 = _dll("user32")
+    kernel32 = _dll("kernel32")
+
+    user32.OpenClipboard.argtypes = (wintypes.HWND,)
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = (wintypes.UINT,)
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.IsClipboardFormatAvailable.argtypes = (wintypes.UINT,)
+    user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    user32.CloseClipboard.restype = wintypes.BOOL
+    kernel32.GlobalLock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes = (wintypes.HGLOBAL,)
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        return ""
+
+    try:
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return ""
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        locked = kernel32.GlobalLock(handle)
+        if not locked:
+            return ""
+        try:
+            # 内容以 \0 结尾的 UTF-16；剪贴板里可能带多余尾零，去掉
+            return ctypes.wstring_at(locked).rstrip("\x00")
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
 # ==========================================================================
 # 高 DPI
 # ==========================================================================

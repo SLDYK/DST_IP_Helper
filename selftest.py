@@ -226,5 +226,157 @@ except Exception as exc:  # noqa: BLE001
 
 
 # ==========================================================================
+print("\n== 11b. PyQt6 中继标签页 ==")
+try:
+    from PyQt6.QtWidgets import QApplication  # noqa: E402
+except ImportError:
+    skip("PyQt6 中继标签页", "未安装 PyQt6（基础解释器不含 GUI 依赖）")
+else:
+    try:
+        import os as _os
+
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from dst_ip_join import gui_qt  # noqa: E402
+
+        _qt_app = QApplication.instance() or QApplication(sys.argv)
+        # auto_run=False：离屏测试不碰真实网络诊断（否则会卡十几秒）
+        _qt_win = gui_qt.MainWindow(auto_run=False)
+        check("PyQt6 中继标签页存在", _qt_win.tabs.count() == 2,
+              f"{_qt_win.tabs.count()} 个标签页")
+        check(
+            "中继向导控件齐全",
+            all(
+                hasattr(_qt_win, name)
+                for name in (
+                    "relay_ready_view",
+                    "rb_host",
+                    "rb_join",
+                    "host_panel",
+                    "join_panel",
+                    "host_code_view",
+                    "join_code_input",
+                    "host_code_input",
+                    "join_cmd_view",
+                    "btn_join_apply",
+                    "btn_join_start",
+                )
+            ),
+        )
+        _qt_win.close()
+        check("PyQt6 中继窗口能干净关闭", True)
+    except Exception as exc:  # noqa: BLE001
+        check("PyQt6 中继标签页", False, f"{type(exc).__name__}: {exc}")
+
+
+# ==========================================================================
+print("\n== 12. UDP 中继（纯转发，不解析协议）==")
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from dst_ip_join import relay  # noqa: E402
+
+check(
+    "解析 IPv4 端点",
+    relay.parse_endpoint("1.2.3.4:10999") == ("1.2.3.4", 10999),
+)
+check(
+    "解析带方括号的 IPv6 端点",
+    relay.parse_endpoint("[2409:8a60::1]:20000") == ("2409:8a60::1", 20000),
+)
+try:
+    relay.parse_endpoint("::1:10999")
+    check("未加方括号的 IPv6 被拒绝", False, "竟然接受了，会有歧义")
+except ValueError:
+    check("未加方括号的 IPv6 被拒绝", True, "提示要写成 [::1]:10999")
+
+allow = relay.AddressAllowList(["2409:8a60::/32", "192.168.10.0/24"])
+check("白名单命中 IPv6 前缀", allow.allows("2409:8a60:cc40:8ea4::1"))
+check("白名单命中 IPv4 网段", allow.allows("192.168.10.4"))
+check("白名单拒绝未列出的地址", not allow.allows("2001:db8::1"))
+
+v4_addrs, v6_addrs = relay.list_local_addresses()
+check("能列出本机 IPv4 地址", bool(v4_addrs), "、".join(v4_addrs) or "（无）")
+if v6_addrs:
+    check("能列出本机 IPv6 地址", True, f"共 {len(v6_addrs)} 个")
+else:
+    skip("列出本机 IPv6 地址", "本机没有启用 IPv6")
+
+# 从任意文本提取地址（朋友把地址发给主机时常直接粘一整段话）
+extracted = relay.extract_addresses("我的地址是 2409:8a60:cc40::1，谢谢")
+check("extract_addresses 提取中文句中的 IPv6",
+      extracted == ["2409:8a60:cc40::1"], str(extracted))
+extracted = relay.extract_addresses("连 192.168.1.100:10999 或 10.0.0.5")
+check("extract_addresses 提取带端口的 IPv4",
+      "192.168.1.100" in extracted and "10.0.0.5" in extracted, str(extracted))
+extracted = relay.extract_addresses("回环 ::1 与链路本地 fe80::1 不该出现")
+check("extract_addresses 忽略回环/链路本地", extracted == [], str(extracted))
+
+# 剪贴板读回（主机端「从剪贴板导入白名单」依赖它）
+clip_marker = "SELFTEST-CLIP-2409:8a60::99"
+if winproc.set_clipboard_text(clip_marker):
+    check("剪贴板读回一致", winproc.get_clipboard_text() == clip_marker,
+          repr(winproc.get_clipboard_text()[:40]))
+else:
+    skip("剪贴板读回", "写入剪贴板失败（可能被占用）")
+
+# 双中继端到端：游戏服务器 <- 主机侧中继 <-(IPv6)-> 朋友侧中继 <- 客户端
+game = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+game.bind(("127.0.0.1", 0))
+game.settimeout(3.0)
+game_port = game.getsockname()[1]
+relays: list = []
+client = None
+try:
+    host_rule = relay.ForwardRule("[::1]:0", f"127.0.0.1:{game_port}")
+    _, host_relay_port = host_rule.actual_listen_endpoint()
+    guest_rule = relay.ForwardRule("127.0.0.1:0", f"[::1]:{host_relay_port}")
+    _, guest_relay_port = guest_rule.actual_listen_endpoint()
+
+    relays = [
+        relay.UdpRelay([host_rule], idle_timeout=0, log=lambda _: None),
+        relay.UdpRelay([guest_rule], idle_timeout=0, log=lambda _: None),
+    ]
+    for item in relays:
+        threading.Thread(
+            target=item.run, kwargs={"max_seconds": 6}, daemon=True
+        ).start()
+    time.sleep(0.5)
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client.bind(("127.0.0.1", 0))
+    client.settimeout(3.0)
+
+    payload = b"selftest-upstream" * 20
+    client.sendto(payload, ("127.0.0.1", guest_relay_port))
+    got, seen_from = game.recvfrom(65535)
+    check("中继上行：字节原样送达", got == payload, f"{len(got)} 字节")
+    check(
+        "中继上行：服务器看到的是独立回环地址",
+        seen_from[0].startswith("127.0.0.") and seen_from[0] != "127.0.0.1",
+        f"来源 {seen_from[0]}:{seen_from[1]}",
+    )
+
+    reply = b"selftest-downstream" * 30
+    game.sendto(reply, seen_from)
+    back, back_from = client.recvfrom(65535)
+    check("中继下行：字节原样回传", back == reply, f"{len(back)} 字节")
+    check(
+        "中继下行：回包来源正是客户端所连的地址",
+        back_from[:2] == ("127.0.0.1", guest_relay_port),
+        f"来源 {back_from[0]}:{back_from[1]}",
+    )
+except socket.timeout as exc:
+    check("中继端到端转发", False, f"超时：{exc}")
+except OSError as exc:
+    check("中继端到端转发", False, f"{type(exc).__name__}: {exc}")
+finally:
+    for item in relays:
+        item.stop()
+    game.close()
+    if client is not None:
+        client.close()
+
+
+# ==========================================================================
 print(f"\n结果：通过 {PASSED}，失败 {FAILED}，跳过 {SKIPPED}")
 sys.exit(1 if FAILED else 0)

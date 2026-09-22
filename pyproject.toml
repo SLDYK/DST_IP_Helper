@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 dst-ip-join = "cli:main"
 dst-ip-join-gui = "app:main"
+dst-relay = "dst_ip_join.relay:main"
 
 [tool.setuptools]
 packages = ["dst_ip_join"]
