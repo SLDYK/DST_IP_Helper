@@ -35,12 +35,31 @@ python -m venv .venv
 
 ### 方式三：自己打包单文件 exe
 
+用 **Nuitka** 把 Python 编译成 C 再打包，产物更小、启动更快，也不容易被反编译。
+
 ```bat
-.venv\Scripts\python.exe -m pip install pyinstaller
+.venv\Scripts\python.exe -m pip install nuitka ordered-set zstandard
 build.bat
 ```
 
-产物为 `dist\饥荒IP联机助手.exe`。
+产物为 `dist\饥荒IP联机助手.exe`（约 20 MB）。
+
+**前置条件：需要一个 C 编译器**，二者任一即可：
+
+| 编译器 | 说明 |
+| --- | --- |
+| **MSVC**（推荐） | 安装 Visual Studio 时勾选「使用 C++ 的桌面开发」；Nuitka 会自动通过 vswhere 找到 |
+| MinGW | 装上 `gcc.exe` 并在 PATH 里，再加 `--mingw64` |
+
+首次编译较慢（约 2~3 分钟，PyQt6 模块多），之后有缓存会快很多。
+
+```bat
+build.bat --no-onefile     目录版（启动更快，便于调试）
+build.bat --keep-output    保留中间产物，排查编译问题用
+build.bat --help           全部选项
+```
+
+> 若杀毒软件误报，是单文件自解压引导器的通病；`--no-onefile` 的目录版通常不会被误报。
 
 ---
 
@@ -294,7 +313,9 @@ DST_Server/
 ├── selftest.py        自检脚本，验证底层 Win32 封装与中继转发
 ├── probe_host.py      排查某台设备开了哪些服务（诊断光猫时很有用）
 ├── pyproject.toml     打包配置（含 PyQt6 依赖与命令入口）
-├── build_exe.spec     PyInstaller 打包配置
+├── build.bat          打包入口（调用 Nuitka）
+├── build_nuitka.py    Nuitka 构建脚本（选项与版本信息都在这里）
+├── build_exe.spec     PyInstaller 旧配置（已不用，留作备选）
 └── dst_ip_join/
     ├── config.py      端口、STUN 服务器、公网 IP 接口等常量
     ├── winproc.py     ctypes 封装：进程、UDP 表、网卡地址、剪贴板、提权

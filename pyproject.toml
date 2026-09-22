@@ -18,6 +18,15 @@ dst-ip-join = "cli:main"
 dst-ip-join-gui = "app:main"
 dst-relay = "dst_ip_join.relay:main"
 
+# 打包成单文件 exe 需要（另需本机有 C 编译器，见 README）：
+#   pip install -e ".[build]"
+[project.optional-dependencies]
+build = [
+    "nuitka>=2.0",
+    "ordered-set",
+    "zstandard",
+]
+
 [tool.setuptools]
 packages = ["dst_ip_join"]
 py-modules = ["app", "cli", "main"]

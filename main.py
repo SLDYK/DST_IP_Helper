@@ -20,11 +20,26 @@ def _bootstrap() -> None:
 
 
 def _show_fatal(message: str) -> None:
-    """用 pythonw 启动时没有控制台，出错时弹窗显示堆栈。"""
+    """无控制台（打包后的 windowed exe）时，出错要弹窗显示堆栈。
+
+    优先 PyQt6：打包时会排除 tkinter（省体积），只用 tkinter 的话
+    窗口模式下启动失败就什么都看不到。
+    """
     try:
         sys.stderr.write(message + "\n")
     except Exception:
         pass
+
+    try:
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+
+        app = QApplication.instance() or QApplication([])
+        QMessageBox.critical(None, "饥荒联机版 IP 联机助手", message)
+        del app
+        return
+    except Exception:
+        pass
+
     try:
         import tkinter as tk
         from tkinter import messagebox
