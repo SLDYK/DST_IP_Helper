@@ -81,6 +81,118 @@ def running_process_names() -> list[str]:
     return names
 
 
+def read_exe_version_info(path: str) -> dict[str, str]:
+    """读 PE 里的版本资源（ProductName / FileVersion 等）。
+
+    用途：Nuitka 有时会在写资源时报
+    ``Failed to add resources ... error code 22`` 却仍报成功
+    （多由杀毒软件占用新生成的文件导致）。那会让图标和版本号**静默丢失**，
+    所以产物必须自己验一遍，不能只听构建器说成功。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    result: dict[str, str] = {}
+    if not os.path.exists(path):
+        return result
+
+    try:
+        version = ctypes.WinDLL("version", use_last_error=True)
+    except OSError:
+        return result
+
+    version.GetFileVersionInfoSizeW.argtypes = (
+        wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD),
+    )
+    version.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+    version.GetFileVersionInfoW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+    )
+    version.GetFileVersionInfoW.restype = wintypes.BOOL
+    version.VerQueryValueW.argtypes = (
+        ctypes.c_void_p, wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT),
+    )
+    version.VerQueryValueW.restype = wintypes.BOOL
+
+    ignored = wintypes.DWORD(0)
+    size = version.GetFileVersionInfoSizeW(path, ctypes.byref(ignored))
+    if size == 0:
+        return result
+
+    buf = ctypes.create_string_buffer(size)
+    if not version.GetFileVersionInfoW(path, 0, size, buf):
+        return result
+
+    # 先从 VarFileInfo\Translation 拿到语言与代码页，再拼出查询路径
+    pointer = ctypes.c_void_p()
+    length = wintypes.UINT(0)
+    if not version.VerQueryValueW(
+        buf, r"\VarFileInfo\Translation", ctypes.byref(pointer), ctypes.byref(length)
+    ):
+        return result
+    if not pointer.value or length.value < 4:
+        return result
+    lang, codepage = ctypes.cast(
+        pointer, ctypes.POINTER(ctypes.c_ushort * 2)
+    ).contents
+    prefix = f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\"
+
+    for key in (
+        "ProductName", "FileVersion", "CompanyName",
+        "FileDescription", "OriginalFilename",
+    ):
+        pointer = ctypes.c_void_p()
+        length = wintypes.UINT(0)
+        if version.VerQueryValueW(
+            buf, prefix + key, ctypes.byref(pointer), ctypes.byref(length)
+        ) and pointer.value:
+            # 注意：VerQueryValueW 回报的是**字节数**，不是字符数。
+            # 若把它当字符数传给 wstring_at 会多读一倍，把后面的资源串也带出来。
+            # 直接用不带长度的 wstring_at，它读到 NUL 就停，正好是完整值。
+            result[key] = ctypes.wstring_at(pointer.value)
+
+    return result
+
+
+def verify_product(path: str) -> list[str]:
+    """校验产物是否带上了图标/版本资源。返回问题列表（空 = 正常）。"""
+    problems: list[str] = []
+    if not os.path.exists(path):
+        return [f"产物不存在：{path}"]
+
+    info = read_exe_version_info(path)
+    if not info:
+        problems.append("读不到任何版本资源")
+    else:
+        if not info.get("ProductName"):
+            problems.append("缺少 ProductName")
+        if not info.get("FileVersion"):
+            problems.append("缺少 FileVersion")
+
+    # 图标：PE 里至少应有一个图标组
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ExtractIconExW.argtypes = (
+            wintypes.LPCWSTR, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+            wintypes.UINT,
+        )
+        shell32.ExtractIconExW.restype = wintypes.UINT
+        big = (ctypes.c_void_p * 8)()
+        small = (ctypes.c_void_p * 8)()
+        count = shell32.ExtractIconExW(path, -1, big, small, 8)
+        if not count:
+            problems.append("没有内嵌图标")
+    except Exception as exc:  # noqa: BLE001 - 图标检查失败不算致命
+        problems.append(f"图标检查出错：{type(exc).__name__}")
+
+    return problems
+
+
 def build_command(onefile: bool, jobs: int | None) -> list[str]:
     version = read_version()
     # Windows 版本资源需要 4 段数字，1.0.0 -> 1.0.0.0
@@ -187,13 +299,33 @@ def main(argv: list[str] | None = None) -> int:
         return code
 
     print(f"\n[OK] 构建完成，耗时 {elapsed:.0f} 秒")
-    if onefile:
-        out = os.path.join(DIST, EXE_NAME)
-        if os.path.exists(out):
-            size = os.path.getsize(out) / 1024 / 1024
-            print(f"     产物：{out}（{size:.1f} MB）")
-    else:
+    if not onefile:
         print(f"     产物目录：{os.path.join(DIST, 'main.dist')}")
+        return 0
+
+    out = os.path.join(DIST, EXE_NAME)
+    if os.path.exists(out):
+        size = os.path.getsize(out) / 1024 / 1024
+        print(f"     产物：{out}（{size:.1f} MB）")
+
+    # 构建器说成功不代表资源写进去了：Nuitka 遇到
+    # "Failed to add resources ... error code 22"（多为杀毒软件占用新文件）
+    # 仍会返回成功，结果是图标/版本号静默丢失。所以自己验一遍。
+    problems = verify_product(out)
+    if problems:
+        print()
+        print("[WARNING] 产物校验未通过，图标或版本信息可能丢失：")
+        for item in problems:
+            print(f"          · {item}")
+        info = read_exe_version_info(out)
+        if info:
+            print(f"          实际读到的版本资源：{info}")
+        print("          多半是杀毒软件在扫新生成的文件，关掉实时防护后重新打包即可。")
+        return 2
+
+    info = read_exe_version_info(out)
+    print(f"     校验：ProductName={info.get('ProductName')} "
+          f"FileVersion={info.get('FileVersion')} 图标/版本资源正常")
     return 0
 
 

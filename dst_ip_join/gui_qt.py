@@ -1248,10 +1248,34 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if winproc.request_admin_restart():
+
+        result = winproc.request_admin_restart_detailed(hwnd=int(self.winId()))
+        if result.started:
             QApplication.instance().quit()
+            return
+
+        # 失败原因要原样告诉用户，否则「取消或失败」根本没法排查
+        if result.declined:
+            QMessageBox.information(
+                self,
+                config.APP_NAME,
+                f"{result.message}\n\n"
+                "如果 UAC 授权框没弹出来，可能是被安全软件拦了；\n"
+                "也可以直接右键程序选「以管理员身份运行」。",
+            )
+            self._append_log(f"[WARN] 提权未完成：{result.message}（错误码 {result.code}）")
         else:
-            QMessageBox.warning(self, config.APP_NAME, "提权请求被取消或失败")
+            QMessageBox.warning(
+                self,
+                config.APP_NAME,
+                f"{result.message}\n"
+                f"错误码：{result.code}\n\n"
+                f"启动命令：\n{result.exe}\n{result.params}\n\n"
+                "可以直接右键程序选「以管理员身份运行」绕过。",
+            )
+            self._append_log(
+                f"[FAIL] 提权失败：{result.message}（错误码 {result.code}）"
+            )
 
     # ------------------------------------------------------------------
     # 完成回调

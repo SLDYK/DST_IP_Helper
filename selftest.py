@@ -48,6 +48,32 @@ print("== 1. 管理员检测 ==")
 admin = winproc.is_admin()
 check("is_admin 返回布尔值", isinstance(admin, bool), f"当前 = {admin}")
 
+# 提权重启：必须能报出失败原因（旧实现只返回 bool，导致无法排查）
+check(
+    "ShellExecute 错误码有人话说明",
+    all(winproc.describe_shell_error(c) for c in (1223, 5, 2, 3, 31, 0)),
+    winproc.describe_shell_error(1223),
+)
+check("1223 归为「用户取消」而非故障",
+      winproc.ElevationResult(started=False, code=1223).declined)
+check("错误码 2 归为真实失败",
+      not winproc.ElevationResult(started=False, code=2).declined)
+
+# 提权命令必须是绝对路径 + 有工作目录：
+# sys.argv[0] 可能是相对路径（python main.py），而提权后的进程工作目录未必相同
+_elev_exe, _elev_params, _elev_cwd = winproc.build_elevation_command()
+check("提权的 exe 是绝对路径且存在",
+      os.path.isabs(_elev_exe) and os.path.exists(_elev_exe), _elev_exe)
+check("提权指定了存在的工作目录",
+      os.path.isabs(_elev_cwd) and os.path.isdir(_elev_cwd), _elev_cwd)
+check("提权参数里带脚本/可执行文件", bool(_elev_params), _elev_params[:60])
+
+# 无效窗口句柄必须被识别出来（传垃圾句柄会让 UAC 框弹不出来，比传 NULL 更糟）
+check("is_valid_window 拒绝 None / 0 / 越界句柄",
+      not winproc.is_valid_window(None)
+      and not winproc.is_valid_window(0)
+      and not winproc.is_valid_window(999999999))
+
 
 # ==========================================================================
 print("\n== 2. 进程枚举与完整路径 ==")

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import socket
 import struct
 import subprocess
@@ -83,29 +84,123 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
-def request_admin_restart(extra_args: list[str] | None = None) -> bool:
-    """用 UAC 提权重新启动当前脚本（兼容打包后的 exe）。
+# ShellExecute 的返回值 <= 32 就是错误码（shellapi.h 的 SE_ERR_* 与部分 Win32 码混用）。
+# 单独列出来，是因为提权失败时"到底为什么"全靠这个数字，而它很容易被丢掉。
+_SHELL_EXEC_ERRORS = {
+    0: "系统内存或资源不足",
+    2: "找不到指定的文件",
+    3: "找不到指定的路径",
+    5: "系统拒绝了提权请求（可能被安全软件、组策略或父进程完整性级别拦截）",
+    8: "系统内存不足",
+    26: "文件共享冲突",
+    27: "文件关联信息不完整",
+    28: "DDE 会话超时",
+    29: "DDE 事务失败",
+    30: "DDE 服务繁忙",
+    31: "没有可用的关联程序",
+    32: "找不到所需的动态链接库",
+    1223: "UAC 授权被取消（你点了「否」，或授权框超时自动关闭）",
+}
 
-    返回 True 表示提权请求已发出（用户点了「是」），
-    调用方应随后退出自身进程。
+# 这两个码都表示"用户侧没同意"，不该按故障来吓用户
+_USER_DECLINED_CODES = (1223, 5)
+
+
+def describe_shell_error(code: int) -> str:
+    """把 ShellExecute 的错误码翻译成人话。"""
+    return _SHELL_EXEC_ERRORS.get(code, f"未知错误（错误码 {code}）")
+
+
+def is_valid_window(hwnd: int | None) -> bool:
+    """句柄是否指向一个真实存在的窗口。
+
+    作为 UAC 授权框的属主窗口，传一个**无效**句柄比传 NULL 更糟
+    （授权框可能干脆不显示）。所以先校验，无效就退回 NULL。
     """
-    if not IS_WINDOWS:
+    if not hwnd:
+        return False
+    try:
+        user32 = _dll("user32")
+        user32.IsWindow.argtypes = (wintypes.HWND,)
+        user32.IsWindow.restype = wintypes.BOOL
+        return bool(user32.IsWindow(wintypes.HWND(int(hwnd))))
+    except Exception:  # noqa: BLE001
         return False
 
+
+@dataclass
+class ElevationResult:
+    """提权重启的结果。失败时必须带上错误码，否则无法排查。"""
+
+    started: bool = False
+    code: int = 0
+    exe: str = ""
+    params: str = ""
+    detail: str = ""
+
+    @property
+    def message(self) -> str:
+        if self.started:
+            return "已以管理员权限重新启动"
+        if self.code in _USER_DECLINED_CODES:
+            return describe_shell_error(self.code)
+        return f"提权失败：{describe_shell_error(self.code)}"
+
+    @property
+    def declined(self) -> bool:
+        return (not self.started) and self.code in _USER_DECLINED_CODES
+
+
+def build_elevation_command(extra_args: list[str] | None = None) -> tuple[str, str, str]:
+    """算出提权时该启动什么：``(exe, 参数, 工作目录)``。
+
+    单独抽出来是为了让它可测，也为了暴露一个真实易错点：
+    ``sys.argv[0]`` 可能是**相对路径**（例如直接跑 ``python main.py``），
+    而提权后新进程的工作目录不一定与当前一致，相对路径就会找不到脚本。
+    所以这里一律转成绝对路径，并显式指定工作目录。
+    """
     args = list(sys.argv[1:]) + list(extra_args or [])
 
     if is_frozen():
         # 打包成 exe 后：sys.executable 就是程序自身，
         # 直接以管理员身份重启 exe（不能再把 argv[0] 当脚本参数传入）。
-        exe = sys.executable
+        exe = os.path.abspath(sys.executable)
         params = subprocess.list2cmdline(args)
+        workdir = os.path.dirname(exe)
     else:
-        python_exe = sys.executable
-        if not python_exe:
-            return False
-        script = sys.argv[0]
-        exe = python_exe
+        exe = sys.executable
+        if not exe:
+            return "", "", ""
+        exe = os.path.abspath(exe)
+        script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
         params = subprocess.list2cmdline([script] + args)
+        workdir = os.path.dirname(script) or os.getcwd()
+
+    return exe, params, workdir
+
+
+def request_admin_restart_detailed(
+    extra_args: list[str] | None = None,
+    hwnd: int | None = None,
+) -> ElevationResult:
+    """用 UAC 提权重新启动当前程序，并带上失败原因。
+
+    与 :func:`request_admin_restart` 的区别是它不吞错误码 —— 提权失败时
+    「为什么失败」是唯一有用的信息，必须能传到界面上。
+
+    ``hwnd`` 是可选的本程序主窗口句柄，会作为 UAC 授权框的属主窗口。
+    **不要留空**：传 NULL 时授权框可能无法正常置前显示（从终端启动时尤其明显），
+    表现为「没看到授权框就直接失败」。
+    """
+    if not IS_WINDOWS:
+        return ElevationResult(detail="当前系统不是 Windows")
+
+    exe, params, workdir = build_elevation_command(extra_args)
+    if not exe:
+        return ElevationResult(code=2, detail="拿不到可执行文件路径")
+    if not os.path.exists(exe):
+        return ElevationResult(code=2, exe=exe, params=params,
+                               detail=f"可执行文件不存在：{exe}")
 
     try:
         shell32 = _dll("shell32")
@@ -118,12 +213,30 @@ def request_admin_restart(extra_args: list[str] | None = None) -> bool:
             wintypes.LPCWSTR,
             ctypes.c_int,
         )
-        ret = shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
-    except Exception:
-        return False
+        owner = wintypes.HWND(int(hwnd)) if is_valid_window(hwnd) else None
+        ret = shell32.ShellExecuteW(owner, "runas", exe, params, workdir, 1)
+    except Exception as exc:  # noqa: BLE001 - 调用本身失败也要给出原因
+        return ElevationResult(exe=exe, params=params,
+                               detail=f"{type(exc).__name__}: {exc}")
 
-    value = ctypes.cast(ret, ctypes.c_void_p).value if ret else 0
-    return bool(value and value > 32)
+    code = int(ctypes.cast(ret, ctypes.c_void_p).value or 0)
+    if code > 32:
+        return ElevationResult(started=True, code=code, exe=exe, params=params)
+    # <= 32 即为错误码；保留原始值便于排查
+    return ElevationResult(
+        started=False, code=code, exe=exe, params=params,
+        detail=describe_shell_error(code),
+    )
+
+
+def request_admin_restart(extra_args: list[str] | None = None) -> bool:
+    """用 UAC 提权重新启动当前程序。
+
+    返回 True 表示提权请求已发出（用户点了「是」），
+    调用方应随后退出自身进程。需要知道失败原因时用
+    :func:`request_admin_restart_detailed`。
+    """
+    return request_admin_restart_detailed(extra_args).started
 
 
 # ==========================================================================

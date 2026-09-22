@@ -458,14 +458,32 @@ class DstIpJoinApp:
         )
 
     def elevate(self) -> None:
-        if messagebox.askyesno(
+        if not messagebox.askyesno(
             config.APP_NAME,
             "将以管理员权限重新启动本工具（会弹出 UAC 授权框），继续吗？",
         ):
-            if winproc.request_admin_restart():
-                self.root.destroy()
-            else:
-                messagebox.showwarning(config.APP_NAME, "提权请求被取消或失败")
+            return
+        result = winproc.request_admin_restart_detailed(
+            hwnd=self.root.winfo_id()
+        )
+        if result.started:
+            self.root.destroy()
+            return
+        # 失败时必须给出具体原因，否则「取消或失败」没法排查
+        if result.declined:
+            messagebox.showinfo(
+                config.APP_NAME,
+                f"{result.message}\n\n"
+                "如果 UAC 授权框没弹出来，可能是被安全软件拦了；\n"
+                "也可以直接右键程序选「以管理员身份运行」。",
+            )
+        else:
+            messagebox.showwarning(
+                config.APP_NAME,
+                f"{result.message}\n"
+                f"错误码：{result.code}\n\n"
+                "可以直接右键程序选「以管理员身份运行」绕过。",
+            )
 
     # ------------------------------------------------------------------
     # 复制
