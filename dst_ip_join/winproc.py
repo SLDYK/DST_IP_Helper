@@ -151,22 +151,80 @@ class ElevationResult:
         return (not self.started) and self.code in _USER_DECLINED_CODES
 
 
+# Nuitka 打成单文件（onefile）时，程序先把本体和依赖解包到缓存目录再运行，
+# 此时 ``sys.executable`` 指向解包目录里的 ``python.exe`` —— 而那个文件
+# **根本不存在**（解包目录里只有 ``<程序名>.exe``）。
+# 拿它去 ShellExecuteW 必然返回 2（找不到指定的文件），提权重启就永远失败。
+# Nuitka 给这种情况留了线索：单文件引导器会把自己的 PID 写进环境变量
+# NUITKA_ONEFILE_PARENT，子进程继承它，据此就能找回用户真正启动的那个 exe。
+_ONEFILE_PARENT_ENV = "NUITKA_ONEFILE_PARENT"
+_ONEFILE_PATH_ENVS = ("NUITKA_ONEFILE_BINARY", "NUITKA_ONEFILE_ORIGINAL_EXECUTABLE")
+
+
+def onefile_original_executable() -> str:
+    """还原出用户实际启动的那个 exe；还原不了返回空串。
+
+    单文件模式下 ``sys.executable`` 是解包副本（甚至不存在），不能直接拿去提权。
+    优先问环境变量，因为它给的是用户双击/调用的那个绝对路径，
+    在单文件、独立目录两种模式下都对。
+    """
+    raw_pid = os.environ.get(_ONEFILE_PARENT_ENV, "").strip()
+    if raw_pid.isdigit():
+        path = query_process_path(int(raw_pid))
+        if path and os.path.isfile(path):
+            return os.path.abspath(path)
+    for name in _ONEFILE_PATH_ENVS:
+        path = os.environ.get(name, "").strip()
+        if path and os.path.isfile(path):
+            return os.path.abspath(path)
+    # 实测单文件模式的 ``sys.argv[0]`` 也是用户启动的那个 exe 的完整路径，
+    # 所以即使以后 Nuitka 不再设上面那个环境变量，这里也能兜住。
+    if sys.argv and sys.argv[0].lower().endswith(".exe"):
+        path = sys.argv[0]
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+    return ""
+
+
+def _executable_in(folder: str) -> str:
+    """在目录里挑一个可执行文件当最后兜底（跳过 python*.exe 这类解释器）。"""
+    try:
+        for name in sorted(os.listdir(folder)):
+            lower = name.lower()
+            if lower.endswith(".exe") and not lower.startswith("python"):
+                candidate = os.path.join(folder, name)
+                if os.path.isfile(candidate):
+                    return os.path.abspath(candidate)
+    except OSError:
+        pass
+    return ""
+
+
 def build_elevation_command(extra_args: list[str] | None = None) -> tuple[str, str, str]:
     """算出提权时该启动什么：``(exe, 参数, 工作目录)``。
 
-    单独抽出来是为了让它可测，也为了暴露一个真实易错点：
-    ``sys.argv[0]`` 可能是**相对路径**（例如直接跑 ``python main.py``），
-    而提权后新进程的工作目录不一定与当前一致，相对路径就会找不到脚本。
-    所以这里一律转成绝对路径，并显式指定工作目录。
+    单独抽出来是为了让它可测，也为了暴露两个真实易错点：
+
+    1. ``sys.argv[0]`` 可能是**相对路径**（例如直接跑 ``python main.py``），
+       而提权后新进程的工作目录不一定与当前一致，相对路径就会找不到脚本。
+    2. 打包成单文件后 ``sys.executable`` 指向**解包副本**而不是程序本身，
+       见 :func:`onefile_original_executable`。
+
+    所以这里一律先还原再转绝对路径，并显式指定工作目录。
     """
     args = list(sys.argv[1:]) + list(extra_args or [])
 
     if is_frozen():
-        # 打包成 exe 后：sys.executable 就是程序自身，
-        # 直接以管理员身份重启 exe（不能再把 argv[0] 当脚本参数传入）。
-        exe = os.path.abspath(sys.executable)
+        # 打包后要重启的是「程序自身」，必须先还原成用户启动的那个 exe，
+        # 否则单文件模式下提权会以「找不到指定的文件」告终。
+        exe = onefile_original_executable()
+        if not exe:
+            exe = os.path.abspath(sys.executable)
+            if not os.path.isfile(exe):
+                # 兜底：解包目录里通常就放着可执行文件本体
+                exe = _executable_in(os.path.dirname(exe))
         params = subprocess.list2cmdline(args)
-        workdir = os.path.dirname(exe)
+        workdir = os.path.dirname(exe) if exe else ""
     else:
         exe = sys.executable
         if not exe:
@@ -199,8 +257,12 @@ def request_admin_restart_detailed(
     if not exe:
         return ElevationResult(code=2, detail="拿不到可执行文件路径")
     if not os.path.exists(exe):
+        hint = ""
+        if os.environ.get(_ONEFILE_PARENT_ENV):
+            hint = "（单文件模式，未能还原到用户启动的那个 exe；" \
+                   "可直接右键程序选「以管理员身份运行」）"
         return ElevationResult(code=2, exe=exe, params=params,
-                               detail=f"可执行文件不存在：{exe}")
+                               detail=f"可执行文件不存在：{exe}{hint}")
 
     try:
         shell32 = _dll("shell32")

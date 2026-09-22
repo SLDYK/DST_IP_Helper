@@ -11,8 +11,10 @@ ctypes 调 Win32 最容易在「64 位句柄被截断」和「网络字节序换
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import sys
+import tempfile
 
 if sys.platform != "win32":
     print("这个自检脚本只能在 Windows 上运行")
@@ -73,6 +75,62 @@ check("is_valid_window 拒绝 None / 0 / 越界句柄",
       not winproc.is_valid_window(None)
       and not winproc.is_valid_window(0)
       and not winproc.is_valid_window(999999999))
+
+# 单文件打包（Nuitka onefile）下 sys.executable 指向解包目录里的 python.exe，
+# 该文件根本不存在，提权必然报「找不到指定的文件」（错误码 2）。
+# 必须能还原成用户实际启动的那个 exe。
+_prev_onefile = {k: os.environ.get(k) for k in winproc._ONEFILE_PATH_ENVS}
+_probe_dir = tempfile.mkdtemp(prefix="dstip_elev_")
+_fake_exe = os.path.join(_probe_dir, "fake_original.exe")
+with open(_fake_exe, "wb") as _handle:
+    _handle.write(b"MZ")
+_real_fake_exe = os.path.abspath(_fake_exe)
+try:
+    for _key in winproc._ONEFILE_PATH_ENVS:
+        os.environ[_key] = _real_fake_exe
+    check("能从环境变量还原原始 exe",
+          winproc.onefile_original_executable() == _real_fake_exe,
+          winproc.onefile_original_executable())
+
+    for _key in winproc._ONEFILE_PATH_ENVS:
+        os.environ[_key] = os.path.join(_probe_dir, "not_here.exe")
+    check("环境变量指向不存在的文件时不被采信",
+          winproc.onefile_original_executable() == "")
+
+    # 冻结分支：提权必须指向还原结果，而不是 sys.executable 那个副本
+    os.environ[winproc._ONEFILE_PATH_ENVS[0]] = _real_fake_exe
+    _saved_frozen = winproc.is_frozen
+    winproc.is_frozen = lambda: True  # type: ignore[assignment]
+    try:
+        _fz_exe, _fz_params, _fz_cwd = winproc.build_elevation_command()
+    finally:
+        winproc.is_frozen = _saved_frozen  # type: ignore[assignment]
+    check("冻结模式下提权指向还原出的 exe，而非 sys.executable 副本",
+          _fz_exe == _real_fake_exe, f"{_fz_exe}（sys.executable={sys.executable}）")
+    check("冻结模式下工作目录是 exe 所在目录",
+          os.path.isdir(_fz_cwd) and os.path.abspath(_fz_cwd) == _probe_dir, _fz_cwd)
+
+    # 兜底：环境变量都不在时，用 sys.argv[0]（实测单文件模式下它就是真实 exe）
+    for _key in winproc._ONEFILE_PATH_ENVS:
+        os.environ.pop(_key, None)
+    _saved_argv = sys.argv
+    sys.argv = [_real_fake_exe]
+    try:
+        check("无环境变量时用 sys.argv[0] 兜底",
+              winproc.onefile_original_executable() == _real_fake_exe,
+              winproc.onefile_original_executable())
+        sys.argv = [os.path.abspath(__file__)]
+        check("sys.argv[0] 不是 exe 时不乱猜",
+              winproc.onefile_original_executable() == "")
+    finally:
+        sys.argv = _saved_argv
+finally:
+    for _key, _value in _prev_onefile.items():
+        if _value is None:
+            os.environ.pop(_key, None)
+        else:
+            os.environ[_key] = _value
+    shutil.rmtree(_probe_dir, ignore_errors=True)
 
 
 # ==========================================================================

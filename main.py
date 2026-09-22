@@ -52,8 +52,52 @@ def _show_fatal(message: str) -> None:
         pass
 
 
+def _dump_elevation_probe() -> int | None:
+    """诊断用：设置环境变量 ``DSTIP_ELEVATION_PROBE=<文件路径>`` 时，
+    把「提权重启会启动什么」写进该文件并直接退出，不开界面。
+
+    打包成无控制台的 windowed exe 后，提权路径到底解析成了什么完全看不到，
+    而这一步很易错（单文件模式下 ``sys.executable`` 是解包副本，甚至不存在）。
+    有了它就能在**不触发 UAC**的情况下核实，避免直接弹授权框干扰测试。
+    """
+    target = os.environ.get("DSTIP_ELEVATION_PROBE", "").strip()
+    if not target:
+        return None
+    lines: list[str] = []
+    try:
+        from dst_ip_join import winproc
+
+        exe, params, workdir = winproc.build_elevation_command()
+        lines = [
+            f"sys.executable = {sys.executable}",
+            f"sys.argv = {sys.argv}",
+            f"is_frozen = {winproc.is_frozen()}",
+            f"frozen_attr = {getattr(sys, 'frozen', None)}",
+            f"compiled = {'__compiled__' in globals()}",
+            f"{winproc._ONEFILE_PARENT_ENV} = "
+            f"{os.environ.get(winproc._ONEFILE_PARENT_ENV, '(未设置)')}",
+            f"original_exe = {winproc.onefile_original_executable()}",
+            f"elevate_exe = {exe}",
+            f"elevate_exe_exists = {os.path.isfile(exe) if exe else False}",
+            f"elevate_params = {params}",
+            f"elevate_workdir = {workdir}",
+            f"workdir_is_dir = {os.path.isdir(workdir) if workdir else False}",
+        ]
+    except Exception:  # noqa: BLE001 - 诊断代码本身出错也要留下痕迹
+        lines = ["probe failed:"] + traceback.format_exc().splitlines()
+    try:
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+    return 0
+
+
 def main() -> int:
     _bootstrap()
+    probe = _dump_elevation_probe()
+    if probe is not None:
+        return probe
     try:
         from dst_ip_join import gui_qt as gui
     except ImportError:
