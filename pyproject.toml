@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dst-ip-join"
-version = "1.1.0"
+version = "1.1.1"
 description = "饥荒联机版 IP 联机助手：自动配置端口映射与防火墙，生成可分享的直连地址"
 readme = "README.md"
 requires-python = ">=3.10"
