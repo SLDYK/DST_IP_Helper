@@ -3,5 +3,8 @@
 # 若不需要 PyQt6 界面，可跳过，程序会自动退回 Tkinter 界面。
 PyQt6>=6.6
 
-# 打包单文件 exe 时需要（可选）
-# pyinstaller>=6.0
+# 打包单文件 exe 时需要（可选），详见 README「方式三」：
+#   nuitka>=2.0
+#   ordered-set
+#   zstandard
+# 注意：除以上包外还需本机装有 C 编译器（MSVC 或 MinGW）。

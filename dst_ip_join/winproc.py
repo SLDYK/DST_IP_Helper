@@ -76,14 +76,15 @@ def is_admin() -> bool:
 def is_frozen() -> bool:
     """判断当前是否运行在打包后的 exe 里。
 
-    PyInstaller 会设 ``sys.frozen``，而 **Nuitka 不设**它 —— Nuitka 给每个被编译的
-    模块注入 ``__compiled__`` 全局。两个都认，否则切到 Nuitka 后提权重启会失效。
+    多数打包器（PyInstaller / cx_Freeze / py2exe 等）会设 ``sys.frozen``，
+    而 **Nuitka 不设**它 —— Nuitka 给每个被编译的模块注入 ``__compiled__`` 全局。
+    两个都认，否则换打包器后提权重启会失效。
     """
     return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
 def request_admin_restart(extra_args: list[str] | None = None) -> bool:
-    """用 UAC 提权重新启动当前脚本（兼容 PyInstaller / Nuitka 打包后的 exe）。
+    """用 UAC 提权重新启动当前脚本（兼容打包后的 exe）。
 
     返回 True 表示提权请求已发出（用户点了「是」），
     调用方应随后退出自身进程。

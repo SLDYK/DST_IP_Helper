@@ -312,10 +312,9 @@ DST_Server/
 ├── cli.py             命令行入口
 ├── selftest.py        自检脚本，验证底层 Win32 封装与中继转发
 ├── probe_host.py      排查某台设备开了哪些服务（诊断光猫时很有用）
-├── pyproject.toml     打包配置（含 PyQt6 依赖与命令入口）
+├── pyproject.toml     项目配置（含 PyQt6 依赖与命令入口）
 ├── build.bat          打包入口（调用 Nuitka）
 ├── build_nuitka.py    Nuitka 构建脚本（选项与版本信息都在这里）
-├── build_exe.spec     PyInstaller 旧配置（已不用，留作备选）
 └── dst_ip_join/
     ├── config.py      端口、STUN 服务器、公网 IP 接口等常量
     ├── winproc.py     ctypes 封装：进程、UDP 表、网卡地址、剪贴板、提权
