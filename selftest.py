@@ -738,5 +738,52 @@ check("无匹配存档时 cluster 为 None 但仍可接管",
 
 
 # ==========================================================================
+print("\n== 16. CLI 开服路径（用桩代替真实进程）==")
+
+# 回归：曾因 `def log` 定义写在 --start-server 块之后，闭包引用未绑定的自由变量，
+# 导致 `cli.py --start-server` 直接 NameError 崩溃。这里用桩跑一遍该代码路径。
+import cli as _cli  # noqa: E402
+
+
+class _StubManager:
+    """假的 ServerManager：立刻回调、立刻结束监控循环，不起真实进程。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.started = False
+
+    def start_all(self, *, wait_ready=True, timeout=150.0, callback=None):
+        if callback:
+            callback("info", "桩：正在启动主分片")   # 走 cli 的 note -> log
+            callback("ready", "桩：就绪")
+        self.started = True
+
+    def pump_logs(self) -> str:
+        return "[Master] 桩日志"
+
+    def any_running(self) -> bool:
+        return False          # 让监控循环立即结束
+
+    def stop_all(self) -> None:
+        pass
+
+
+if _found and _real:
+    _rc_cluster = next((c for c in _real if c.name == "Cluster_2"), _real[0])
+    _orig_manager = server.ServerManager
+    server.ServerManager = _StubManager  # type: ignore[assignment]
+    try:
+        _rc = _cli.main(["--start-server", _rc_cluster.name])
+        check("CLI --start-server 能跑完（捕获闭包未绑定等错误）", _rc == 0,
+              f"返回 {_rc}")
+    except Exception as exc:  # noqa: BLE001
+        check("CLI --start-server 能跑完（捕获闭包未绑定等错误）", False,
+              f"{type(exc).__name__}: {exc}")
+    finally:
+        server.ServerManager = _orig_manager  # type: ignore[assignment]
+else:
+    skip("CLI --start-server 路径", "本机未扫到存档")
+
+
+# ==========================================================================
 print(f"\n结果：通过 {PASSED}，失败 {FAILED}，跳过 {SKIPPED}")
 sys.exit(1 if FAILED else 0)

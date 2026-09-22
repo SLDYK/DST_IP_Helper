@@ -87,6 +87,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from dst_ip_join import diagnostics, server
 
+    def log(message: str) -> None:
+        print(message, flush=True)
+
     # ---- 通用化：路径覆盖设置 -------------------------------------------------
     if args.set_paths:
         s = server.Settings(
@@ -254,9 +257,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # ---- 默认：网络诊断 --------------------------------------------------------
-
-    def log(message: str) -> None:
-        print(message, flush=True)
 
     if args.cleanup:
         if not args.yes:
