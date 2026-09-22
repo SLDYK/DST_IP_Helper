@@ -16,6 +16,7 @@ import shutil
 import socket
 import sys
 import tempfile
+from pathlib import Path
 
 if sys.platform != "win32":
     print("这个自检脚本只能在 Windows 上运行")
@@ -326,8 +327,26 @@ else:
         _qt_app = QApplication.instance() or QApplication(sys.argv)
         # auto_run=False：离屏测试不碰真实网络诊断（否则会卡十几秒）
         _qt_win = gui_qt.MainWindow(auto_run=False)
-        check("PyQt6 中继标签页存在", _qt_win.tabs.count() == 2,
+        check("PyQt6 三个标签页（直连/中继/开服）", _qt_win.tabs.count() == 3,
               f"{_qt_win.tabs.count()} 个标签页")
+        check(
+            "开服标签页控件齐全",
+            all(
+                hasattr(_qt_win, name)
+                for name in (
+                    "cluster_combo",
+                    "cluster_summary",
+                    "mod_list",
+                    "server_update_mods",
+                    "btn_server_start",
+                    "btn_server_attach",
+                    "btn_server_stop",
+                    "server_status_label",
+                    "server_shards_label",
+                    "server_log_view",
+                )
+            ),
+        )
         check(
             "中继向导控件齐全",
             all(
@@ -347,6 +366,9 @@ else:
                 )
             ),
         )
+        # 关窗服务器确认：离屏下必须走默认（停止），绝不弹模态框
+        check("关窗服务器确认在离屏下走默认（停止）",
+              _qt_win._ask_stop_server_on_close() == "stop")
         _qt_win.close()
         check("PyQt6 中继窗口能干净关闭", True)
     except Exception as exc:  # noqa: BLE001
@@ -510,6 +532,209 @@ finally:
     game.close()
     if client is not None:
         client.close()
+
+
+# ==========================================================================
+print("\n== 13. 专用服务器（存档 / 模组扫描）==")
+from dst_ip_join import server  # noqa: E402
+
+_found = server.find_dst_install()
+if _found is None:
+    skip("定位游戏安装目录", "本机未找到（Steam 库扫描无结果）")
+else:
+    _game_dir, _ugc_dir = _found
+    check("定位游戏安装目录",
+          server._nullrenderer(_game_dir) is not None,
+          str(_game_dir))
+    _content = server.workshop_content_dir(_ugc_dir)
+    check("创意工坊内容目录存在", _content.is_dir(), str(_content))
+
+_clusters = server.scan_clusters(
+    workshop_content=server.workshop_content_dir(_ugc_dir) if _found else None,
+    game_dir=_game_dir if _found else None,
+)
+check("扫描到至少一个集群", bool(_clusters), f"共 {len(_clusters)} 个")
+if _clusters:
+    _c = max(_clusters, key=lambda x: len(x.mods))
+    check("集群识别出主分片", _c.master() is not None,
+          f"{_c.name} 共 {len(_c.shards)} 个分片")
+    _ports = _c.ports()
+    check("分片端口已解析（10999/10998）", 10999 in _ports, str(_ports))
+    check("主分片端口是 10999",
+          _c.master() is not None and _c.master().port == 10999)
+    check("解析出存档启用的模组", len(_c.mods) > 0,
+          f"{len(_c.mods)} 个")
+    _missing = _c.missing_mods()
+    check("启用的模组均已本地下载", not _missing,
+          ", ".join(m.id for m in _missing) or "无缺失")
+    if _c.mods:
+        _named = [m for m in _c.mods if m.name]
+        check("能读到模组中文/英文名", bool(_named),
+              _named[0].display_name if _named else "")
+
+# modoverrides 解析的纯逻辑测试（不依赖本机环境）
+_sample = '''return {
+  ["workshop-1"]={ configuration_options={ A=true, B=false }, enabled=true },
+  ["workshop-2"]={ enabled=false },
+  ["workshop-3"]={ configuration_options={}, enabled=true },
+}'''
+_mods = server.parse_modoverrides(_sample)
+check("modoverrides 只取 enabled=true", [m.id for m in _mods] == ["1", "3"],
+      str([m.id for m in _mods]))
+check("modoverrides 配置项计数",
+      next(m for m in _mods if m.id == "1").config_count >= 1)
+
+
+# ==========================================================================
+print("\n== 14. 通用化（路径发现 / Token / 设置覆盖）==")
+import tempfile  # noqa: E402
+
+# 真实的「文档」目录（OneDrive 重定向也能拿到，不只是 home/Documents）
+_docs = server.documents_dir()
+check("documents_dir 存在且是目录", _docs.is_dir(), str(_docs))
+
+# nullrenderer 变体定位（64 位 / 32 位 / 无后缀）
+_g1 = Path(tempfile.mkdtemp(prefix="dst_g1_"))
+(_g1 / "bin64").mkdir()
+(_g1 / "bin64" / "dontstarve_dedicated_server_nullrenderer_x64.exe").write_bytes(b"MZ")
+check("_nullrenderer 识别 bin64/_x64", server._nullrenderer(_g1) is not None)
+_g2 = Path(tempfile.mkdtemp(prefix="dst_g2_"))
+(_g2 / "bin").mkdir()
+(_g2 / "bin" / "dontstarve_dedicated_server_nullrenderer.exe").write_bytes(b"MZ")
+check("_nullrenderer 识别 32 位 bin/ 版本",
+      server._nullrenderer(_g2) is not None
+      and server._nullrenderer(_g2).parent.name == "bin")
+_g3 = Path(tempfile.mkdtemp(prefix="dst_g3_"))
+check("空目录返回 None", server._nullrenderer(_g3) is None)
+
+# Token 校验
+_ok, _ = server.validate_token("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
+check("合法令牌被接受", _ok)
+_ok2, _msg = server.validate_token("")
+check("空令牌被拒绝并给出原因", not _ok2 and bool(_msg))
+_ok3, _tok3 = server.validate_token("  这是说明文字  abcdefgh1234567890ABCD  谢谢 ")
+check("从一段文字里抠出令牌", _ok3 and _tok3 == "abcdefgh1234567890ABCD")
+
+# write_token：二进制写入、冪等、不同则备份
+_tdir = Path(tempfile.mkdtemp(prefix="dst_tok_"))
+_fc = server.ClusterInfo(name="T", path=_tdir, ownerdir=_tdir.parent)
+_p1 = server.write_token(_fc, "TOKEN_AAAA")
+check("write_token 写入字节精确（无多余换行）",
+      _p1.read_bytes() == b"TOKEN_AAAA")
+server.write_token(_fc, "TOKEN_AAAA")
+check("写入相同令牌是冪等的（不生成备份）",
+      not (_tdir / "cluster_token.txt.bak").exists())
+server.write_token(_fc, "TOKEN_BBBB")
+check("换令牌时旧令牌被备份",
+      (_tdir / "cluster_token.txt.bak").read_bytes() == b"TOKEN_AAAA")
+check("写后集群标记为有令牌", _fc.has_token)
+
+# 多存档根扫描（稳定版 + Beta 分支）
+_klei = Path(tempfile.mkdtemp(prefix="dst_klei_")) / "Klei"
+for _conf, _cname in (("DoNotStarveTogether", "Cluster_Stable"),
+                      ("DoNotStarveTogetherBetaBranch", "Cluster_Beta")):
+    _cc = _klei / _conf / "ownerX" / _cname
+    (_cc / "Master").mkdir(parents=True)
+    (_cc / "cluster.ini").write_text(
+        "[NETWORK]\ncluster_name = " + _cname + "\n", encoding="utf-8")
+    (_cc / "Master" / "server.ini").write_text(
+        "[NETWORK]\nserver_port = 10999\n\n[SHARD]\nis_master = true\n",
+        encoding="utf-8")
+_found_clusters = server.scan_clusters(klei_root=_klei)
+check("同时扫到稳定版与 Beta 分支", len(_found_clusters) == 2,
+      str([c.name for c in _found_clusters]))
+_beta = next((c for c in _found_clusters if c.name == "Cluster_Beta"), None)
+check("Beta 存档标记了正确的 confdir",
+      _beta is not None and _beta.confdir == "DoNotStarveTogetherBetaBranch")
+
+# 设置覆盖：手动指定游戏目录
+_saved = server.settings()
+try:
+    if _found:
+        server.set_settings(server.Settings(game_dir=str(_game_dir)))
+        _gi = server.find_dst_install()
+        check("用户指定游戏目录后 find_dst_install 用该目录",
+              _gi is not None and _gi[0] == _game_dir)
+    server.set_settings(server.Settings(game_dir=str(_g3)))  # 无效路径
+    try:
+        server.find_dst_install()
+        check("指定无效游戏目录时报错而非静默失败", False)
+    except server.ServerError:
+        check("指定无效游戏目录时报错而非静默失败", True)
+finally:
+    server.set_settings(_saved)
+
+# Settings 序列化往返
+_ss = server.Settings(game_dir="C:\\x", storage_root="D:\\saves", extra_args=["-lan"])
+_round = server.Settings(
+    game_dir=_ss.game_dir, storage_root=_ss.storage_root, extra_args=list(_ss.extra_args))
+check("Settings 字段往返", _round.game_dir == "C:\\x" and _round.extra_args == ["-lan"])
+
+
+# ==========================================================================
+print("\n== 15. 接管：进程发现与监控 ==")
+
+# 命令行参数解析
+_cl = ('-cluster Cluster_2 -shard Master -persistent_storage_root APP:Klei/ '
+       '-conf_dir DoNotStarveTogether -ownerdir 1071833019 '
+       '-sigprefix DST_Master -skip_update_server_mods')
+check("_arg 解析 cluster", server._arg(_cl, "cluster") == "Cluster_2")
+check("_arg 解析 ownerdir", server._arg(_cl, "ownerdir") == "1071833019")
+check("_arg 缺失参数返回 None", server._arg(_cl, "token") is None)
+
+# APP:Klei/ 别名解析
+_root = server._resolve_storage_root("APP:Klei/")
+check("APP:Klei/ 解析到 <文档>\\Klei",
+      _root == server.documents_dir() / "Klei", str(_root))
+check("绝对路径原样返回",
+      server._resolve_storage_root("D:\\saves") == Path("D:\\saves"))
+
+# 构造两个假分片进程（同一集群）+ 一个别的集群，验证分组取进程数最多的
+_p1 = server.ShardProcInfo(pid=999001, name="dontstarve_dedicated_server_nullrenderer_x64.exe",
+                           cmdline=_cl, cluster_name="Cluster_2", shard_name="Master",
+                           ownerdir="1071833019", is_master=True)
+_cl2 = _cl.replace("Master", "Caves").replace("DST_Master", "DST_Secondary")
+_p2 = server.ShardProcInfo(pid=999002, name="dontstarve_dedicated_server_nullrenderer_x64.exe",
+                           cmdline=_cl2, cluster_name="Cluster_2", shard_name="Caves",
+                           ownerdir="1071833019", is_master=False)
+_p3 = server.ShardProcInfo(pid=999003, name="dontstarve_dedicated_server_nullrenderer_x64.exe",
+                           cmdline=_cl.replace("Cluster_2", "Other"),
+                           cluster_name="Other", shard_name="Master", ownerdir="1071833019")
+
+# 真实存档用于匹配
+_real = server.scan_clusters(
+    workshop_content=server.workshop_content_dir(_ugc_dir) if _found else None,
+    game_dir=_game_dir if _found else None)
+_att = server.attach_running_procs(_real, procs=[_p1, _p2, _p3])
+check("接管返回非空", _att is not None)
+check("按进程数最多分组（选中 Cluster_2 的 2 个分片）",
+      _att is not None and len(_att.shards) == 2)
+if _att is not None:
+    check("接管对象匹配到真实存档", _att.cluster is not None
+          and _att.cluster.name == "Cluster_2")
+    check("识别主分片", any(s.is_master for s in _att.shards))
+    check("标记为接管（attached）", _att.attached is True)
+    _st = _att.status()
+    check("status 形状与 ServerManager 对齐",
+          all({"shard", "is_master", "port", "running"} <= set(s) for s in _st))
+    check("status 带 pid 与 attached 标记",
+          all(s.get("attached") and s.get("pid") for s in _st))
+
+# RunningShard 日志增量（用真实存档的 server_log.txt）
+if _att is not None and _att.cluster is not None:
+    _ms = next((s for s in _att.shards if s.is_master), None)
+    if _ms is not None and _ms._log_path is not None:
+        _first = _ms.pump()
+        _second = _ms.pump()
+        check("pump 第二次不重复读（增量为空）", _second == "")
+        check("tail 能返回最近日志", bool(_ms.tail(3)))
+    else:
+        skip("RunningShard 日志增量", "未定位到日志文件")
+
+# 无匹配存档时也能接管（只能监控/停止）
+_att2 = server.attach_running_procs([], procs=[_p3])
+check("无匹配存档时 cluster 为 None 但仍可接管",
+      _att2 is not None and _att2.cluster is None and len(_att2.shards) == 1)
 
 
 # ==========================================================================

@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -35,7 +36,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
 )
 
-from . import config, diagnostics, firewall, relay, winproc
+from . import config, diagnostics, firewall, relay, server, winproc
 
 # ---------------------------------------------------------------------------
 # 主题
@@ -284,6 +285,50 @@ class RelayThread(QThread):
         return self.relay.snapshot()
 
 
+class ServerThread(QThread):
+    """后台扫描存档 / 拉起专用服务器，避免阻塞界面。"""
+
+    scanned = pyqtSignal(object)      # list[server.ClusterInfo]
+    scan_failed = pyqtSignal(str)
+    started = pyqtSignal(object)      # server.ServerManager
+    failed = pyqtSignal(str)
+
+    def __init__(self, mode: str, cluster: server.ClusterInfo | None = None,
+                 *, update_mods: bool = False,
+                 extra_args: list[str] | None = None) -> None:
+        super().__init__()
+        self._mode = mode  # "scan" | "start"
+        self._cluster = cluster
+        self._update_mods = update_mods
+        self._extra_args = list(extra_args or [])
+        self.manager: server.ServerManager | None = None
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            if self._mode == "scan":
+                found = server.default_install()
+                game_dir, ugc_dir = found
+                content = server.workshop_content_dir(ugc_dir)
+                clusters = server.scan_clusters(
+                    workshop_content=content, game_dir=game_dir)
+                self.scanned.emit(clusters)
+            else:
+                assert self._cluster is not None
+                self.manager = server.ServerManager(
+                    self._cluster, update_mods=self._update_mods,
+                    extra_args=self._extra_args)
+                self.manager.start_all(
+                    wait_ready=True,
+                    callback=lambda stage, text: None,  # 日志靠定时器 pump
+                )
+                self.started.emit(self.manager)
+        except Exception:  # noqa: BLE001
+            if self._mode == "scan":
+                self.scan_failed.emit(traceback.format_exc())
+            else:
+                self.failed.emit(traceback.format_exc())
+
+
 # ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
@@ -299,6 +344,12 @@ class MainWindow(QMainWindow):
         self._session = ""           # 本次主机/加入会话的校验值
         self._relay_ready = False    # 就绪检测是否全部通过
         self._host_info: dict | None = None  # 加入方解析出的主机码信息
+        # 开服状态
+        self._clusters: list = []
+        self._server_thread: ServerThread | None = None
+        self._server_scan_thread: ServerThread | None = None
+        self._server_manager = None       # ServerManager 或 AttachedServer
+        self._attached_pending = None     # 检测到待接管的 AttachedServer
 
         self.setWindowTitle(f"{config.APP_NAME}  v{config.APP_VERSION}")
         self.resize(900, 640)
@@ -316,6 +367,7 @@ class MainWindow(QMainWindow):
         main.addWidget(self.tabs, stretch=1)
         self.tabs.addTab(self._build_direct_tab(), "直连配置")
         self.tabs.addTab(self._build_relay_tab(), "UDP 中继")
+        self.tabs.addTab(self._build_server_tab(), "开服")
 
         self._build_statusbar(main)
 
@@ -324,6 +376,11 @@ class MainWindow(QMainWindow):
         self._relay_timer = QTimer(self)
         self._relay_timer.setInterval(1000)
         self._relay_timer.timeout.connect(self._refresh_relay_stats)
+
+        # 开服：日志增量刷新（服务器输出写进 <shard>/server_log.txt，按偏移增量读）
+        self._server_timer = QTimer(self)
+        self._server_timer.setInterval(800)
+        self._server_timer.timeout.connect(self._pump_server_logs)
 
         # 窗口一出来就先跑一次检测；测试可关掉这个开关，避免离屏时也去碰真实网络
         if self._auto_run:
@@ -692,6 +749,428 @@ class MainWindow(QMainWindow):
         slay.addWidget(self.join_status_label)
         col.addWidget(scard)
         return panel
+
+    # ------------------------------------------------------------------
+    # 开服标签页
+    # ------------------------------------------------------------------
+    def _build_server_tab(self) -> QWidget:
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 10, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroll)
+
+        content = QWidget()
+        scroll.setWidget(content)
+        body = QVBoxLayout(content)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(10)
+
+        # 第 1 步：选存档
+        pick = QHBoxLayout()
+        pick.setSpacing(10)
+        body.addLayout(pick)
+
+        scard, slay = self._card("第 1 步 · 选择一个存档")
+        srow = QHBoxLayout()
+        self.cluster_combo = QComboBox()
+        self.cluster_combo.currentIndexChanged.connect(self._on_cluster_changed)
+        srow.addWidget(self.cluster_combo, stretch=1)
+        self.btn_cluster_refresh = QPushButton("刷新")
+        self.btn_cluster_refresh.clicked.connect(self.refresh_clusters)
+        srow.addWidget(self.btn_cluster_refresh)
+        slay.addLayout(srow)
+        self.cluster_summary = QLabel("", objectName="checkDetail")
+        self.cluster_summary.setWordWrap(True)
+        slay.addWidget(self.cluster_summary)
+        self.server_update_mods = QCheckBox("启动前更新模组（连 Steam，较慢；不勾则跳过）")
+        slay.addWidget(self.server_update_mods)
+
+        # 缺令牌时的粘贴区（默认隐藏，仅当前存档缺令牌时显示）
+        self.token_row = QWidget()
+        tlay = QHBoxLayout(self.token_row)
+        tlay.setContentsMargins(0, 0, 0, 0)
+        tlay.setSpacing(6)
+        self.token_input = QLineEdit(objectName="portInput")
+        self.token_input.setPlaceholderText("粘贴 Klei 开服令牌（cluster_token）")
+        tlay.addWidget(self.token_input, stretch=1)
+        self.btn_token_save = QPushButton("保存令牌")
+        self.btn_token_save.clicked.connect(self._on_save_token)
+        tlay.addWidget(self.btn_token_save)
+        self.token_row.setVisible(False)
+        slay.addWidget(self.token_row)
+
+        # 高级设置（默认收起）：路径覆盖，解决环境探测不到的边界情况
+        self.btn_adv_toggle = QPushButton("高级设置 ▸")
+        self.btn_adv_toggle.setFlat(True)
+        self.btn_adv_toggle.clicked.connect(self._on_toggle_adv)
+        slay.addWidget(self.btn_adv_toggle)
+
+        self.adv_panel = QWidget()
+        alay = QVBoxLayout(self.adv_panel)
+        alay.setContentsMargins(8, 4, 8, 4)
+        alay.setSpacing(6)
+
+        grow = QHBoxLayout()
+        grow.addWidget(QLabel("游戏目录："))
+        self.game_dir_input = QLineEdit(objectName="portInput")
+        self.game_dir_input.setPlaceholderText("留空 = 自动从 Steam 库探测")
+        grow.addWidget(self.game_dir_input, stretch=1)
+        btn_g = QPushButton("浏览…")
+        btn_g.clicked.connect(self._on_browse_game_dir)
+        grow.addWidget(btn_g)
+        alay.addLayout(grow)
+
+        srow2 = QHBoxLayout()
+        srow2.addWidget(QLabel("存档根：  "))
+        self.storage_root_input = QLineEdit(objectName="portInput")
+        self.storage_root_input.setPlaceholderText("留空 = <文档>\\Klei")
+        srow2.addWidget(self.storage_root_input, stretch=1)
+        btn_s = QPushButton("浏览…")
+        btn_s.clicked.connect(self._on_browse_storage_root)
+        srow2.addWidget(btn_s)
+        alay.addLayout(srow2)
+
+        crow2 = QHBoxLayout()
+        crow2.addWidget(QLabel("conf_dir："))
+        self.conf_dir_input = QLineEdit(objectName="portInput")
+        self.conf_dir_input.setPlaceholderText("留空 = 自动（稳定版/Beta 各用各的）")
+        crow2.addWidget(self.conf_dir_input, stretch=1)
+        alay.addLayout(crow2)
+
+        erow = QHBoxLayout()
+        erow.addWidget(QLabel("额外参数："))
+        self.extra_args_input = QLineEdit(objectName="portInput")
+        self.extra_args_input.setPlaceholderText("如  -lan -players 6（留空）")
+        erow.addWidget(self.extra_args_input, stretch=1)
+        alay.addLayout(erow)
+
+        srow3 = QHBoxLayout()
+        self.btn_save_settings = QPushButton("保存设置")
+        self.btn_save_settings.clicked.connect(self._on_save_settings)
+        srow3.addWidget(self.btn_save_settings)
+        srow3.addStretch(1)
+        alay.addLayout(srow3)
+
+        self.adv_panel.setVisible(False)
+        slay.addWidget(self.adv_panel)
+        pick.addWidget(scard, stretch=3)
+
+        # 模组清单
+        mcard, mlay = self._card("存档启用的模组")
+        self.mod_list = QPlainTextEdit(objectName="logView")
+        self.mod_list.setReadOnly(True)
+        self.mod_list.setMaximumBlockCount(200)
+        mlay.addWidget(self.mod_list)
+        pick.addWidget(mcard, stretch=2)
+
+        # 第 2 步：启动 / 停止 + 状态
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        body.addLayout(row)
+
+        acard, alay = self._card("第 2 步 · 启动专用服务器")
+        arow = QHBoxLayout()
+        self.btn_server_start = QPushButton("启动服务器", objectName="primary")
+        self.btn_server_start.clicked.connect(self.start_server)
+        self.btn_server_start.setEnabled(False)
+        arow.addWidget(self.btn_server_start)
+        self.btn_server_attach = QPushButton("接管运行中的服务器")
+        self.btn_server_attach.clicked.connect(self.attach_server)
+        self.btn_server_attach.setEnabled(False)
+        arow.addWidget(self.btn_server_attach)
+        self.btn_server_stop = QPushButton("停止服务器", objectName="danger")
+        self.btn_server_stop.clicked.connect(self.stop_server)
+        self.btn_server_stop.setEnabled(False)
+        arow.addWidget(self.btn_server_stop)
+        arow.addStretch(1)
+        alay.addLayout(arow)
+        self.server_status_label = QLabel("尚未选择存档", objectName="statusLabel")
+        self.server_status_label.setWordWrap(True)
+        alay.addWidget(self.server_status_label)
+        self.server_shards_label = QLabel("", objectName="checkDetail")
+        self.server_shards_label.setWordWrap(True)
+        alay.addWidget(self.server_shards_label)
+        row.addWidget(acard, stretch=1)
+
+        # 服务器日志
+        lcard, llay = self._card("服务器日志")
+        self.server_log_view = QPlainTextEdit(objectName="logView")
+        self.server_log_view.setReadOnly(True)
+        self.server_log_view.setMaximumBlockCount(2000)
+        llay.addWidget(self.server_log_view)
+        row.addWidget(lcard, stretch=2)
+
+        # auto_run=False（离屏测试）时不自动扫描，避免后台线程去碰真实文件系统
+        if self._auto_run:
+            self.refresh_clusters()
+        else:
+            self.cluster_combo.addItem("（未扫描）", None)
+        return tab
+
+    # -- 开服：扫描 -----------------------------------------------------------
+
+    def refresh_clusters(self) -> None:
+        if getattr(self, "_server_scan_thread", None) is not None \
+                and self._server_scan_thread.isRunning():
+            return
+        self.cluster_combo.clear()
+        self.cluster_combo.addItem("扫描中…", None)
+        self.mod_list.clear()
+        self._server_scan_thread = ServerThread("scan")
+        self._server_scan_thread.scanned.connect(self._on_clusters_scanned)
+        self._server_scan_thread.scan_failed.connect(self._on_scan_failed)
+        self._server_scan_thread.finished.connect(
+            lambda: setattr(self, "_server_scan_thread", None))
+        self._server_scan_thread.start()
+
+    def _on_scan_failed(self, tb: str) -> None:
+        self.cluster_combo.clear()
+        self.cluster_combo.addItem("扫描失败", None)
+        self._append_server_log(f"[FAIL] 扫描存档失败：\n{tb}")
+
+    def _on_clusters_scanned(self, clusters: list) -> None:
+        self._clusters = clusters or []
+        self.cluster_combo.blockSignals(True)
+        self.cluster_combo.clear()
+        if not self._clusters:
+            self.cluster_combo.addItem("未发现存档", None)
+            self.cluster_combo.setEnabled(False)
+            self.btn_server_start.setEnabled(False)
+        else:
+            self.cluster_combo.setEnabled(True)
+            for c in self._clusters:
+                self.cluster_combo.addItem(f"{c.name} · {c.cluster_name}", c)
+            self.btn_server_start.setEnabled(True)
+            # 默认选模组最多的那个（通常是活跃存档）
+            best = max(range(len(self._clusters)),
+                       key=lambda i: len(self._clusters[i].mods))
+            self.cluster_combo.setCurrentIndex(best)
+        self.cluster_combo.blockSignals(False)
+        self._on_cluster_changed(self.cluster_combo.currentIndex())
+        self._check_running_server()
+
+    def _check_running_server(self) -> None:
+        """扫描后检测是否已有服务器在跑，有则提示可接管。"""
+        if self._server_manager is not None:
+            return  # 已经在管理一个服务器了
+        attached = server.attach_running_procs(self._clusters)
+        if attached is None:
+            self.btn_server_attach.setEnabled(False)
+            self._attached_pending = None
+            return
+        self._attached_pending = attached
+        n = len(attached.shards)
+        cname = attached.cluster.name if attached.cluster else "(未知存档)"
+        self.btn_server_attach.setEnabled(True)
+        self.server_status_label.setText(
+            f"检测到已有 {n} 个分片在运行（{cname}），可点击「接管」纳入管理")
+        self._append_server_log(f"[INFO] 检测到运行中的服务器：{cname}（{n} 个分片）")
+
+    def attach_server(self) -> None:
+        """接管检测到的运行中服务器（只监控/停止，不重复启动）。"""
+        attached = getattr(self, "_attached_pending", None)
+        if attached is None:
+            return
+        self._server_manager = attached
+        self._attached_pending = None
+        self.btn_server_attach.setEnabled(False)
+        self.btn_server_start.setEnabled(False)
+        self.btn_server_stop.setEnabled(True)
+        self.server_status_label.setText("已接管运行中的服务器（监控中）")
+        self._append_server_log("[OK] 已接管运行中的服务器")
+        self._server_timer.start()
+        self._pump_server_logs()
+
+    def _on_cluster_changed(self, _index: int) -> None:
+        cluster = self._current_cluster()
+        self._pump_server_logs()  # 切换存档时清掉旧 manager 的引用即可
+        if cluster is None:
+            self.cluster_summary.setText("")
+            self.mod_list.clear()
+            self.server_shards_label.setText("")
+            return
+        missing = cluster.missing_mods()
+        token_mark = "✓ 有令牌" if cluster.has_token else "✗ 缺令牌"
+        summary = cluster.summary()
+        if missing:
+            summary += f"\n⚠ 有 {len(missing)} 个模组未下载：{', '.join(m.id for m in missing)}"
+        self.cluster_summary.setText(f"{summary}\n{token_mark}")
+
+        lines = []
+        for m in cluster.mods:
+            mark = "" if m.installed else " ✗未下载"
+            cfg = f"（{m.config_count} 项配置）" if m.config_count else ""
+            ver = f" v{m.version}" if m.version else ""
+            lines.append(f"• {m.display_name}{ver}{cfg}{mark}")
+        self.mod_list.setPlainText("\n".join(lines) if lines else "（无存档启用的模组）")
+
+        self.token_row.setVisible(not cluster.has_token)
+        if not cluster.has_token:
+            self.server_status_label.setText("⚠ 该存档缺 cluster_token.txt，请粘贴令牌后保存")
+        elif missing:
+            self.server_status_label.setText("⚠ 有模组未下载，可用启动前更新模组补齐")
+        else:
+            self.server_status_label.setText("就绪，可以启动")
+
+    def _current_cluster(self):
+        data = self.cluster_combo.currentData()
+        return data if isinstance(data, server.ClusterInfo) else None
+
+    # -- 开服：令牌与高级设置 ---------------------------------------------
+
+    def _on_save_token(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        ok, result = server.validate_token(self.token_input.text())
+        if not ok:
+            self._notify("warn", f"令牌无效：{result}")
+            return
+        try:
+            server.write_token(cluster, result)
+        except OSError as exc:
+            self._notify("error", f"写入令牌失败：{exc}")
+            return
+        self.token_input.clear()
+        self.token_row.setVisible(False)
+        self.server_status_label.setText("令牌已保存，可以启动")
+        self._append_server_log(f"[OK] 已为 {cluster.name} 保存令牌")
+        self._on_cluster_changed(self.cluster_combo.currentIndex())
+
+    def _on_toggle_adv(self) -> None:
+        vis = not self.adv_panel.isVisible()
+        self.adv_panel.setVisible(vis)
+        self.btn_adv_toggle.setText("高级设置 ▾" if vis else "高级设置 ▸")
+        if vis:
+            self._load_settings_to_ui()
+
+    def _load_settings_to_ui(self) -> None:
+        s = server.settings()
+        self.game_dir_input.setText(s.game_dir)
+        self.storage_root_input.setText(s.storage_root)
+        self.conf_dir_input.setText(s.conf_dir)
+        self.extra_args_input.setText(" ".join(s.extra_args))
+
+    def _on_browse_game_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "选择饥荒联机版游戏目录（含 bin64\\）", "")
+        if path:
+            self.game_dir_input.setText(path)
+
+    def _on_browse_storage_root(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "选择存档根目录（含 DoNotStarveTogether\\ 的那层）", "")
+        if path:
+            self.storage_root_input.setText(path)
+
+    def _on_save_settings(self) -> None:
+        extra = self.extra_args_input.text().split()
+        s = server.Settings(
+            game_dir=self.game_dir_input.text().strip(),
+            storage_root=self.storage_root_input.text().strip(),
+            conf_dir=self.conf_dir_input.text().strip(),
+            extra_args=extra,
+        )
+        server.set_settings(s)
+        try:
+            server.save_settings(s)
+        except OSError as exc:
+            self._notify("warn", f"设置保存失败：{exc}")
+            return
+        self._notify("info", "已保存。重新扫描或启动服务器后生效。")
+        self.refresh_clusters()
+
+    # -- 开服：启动 / 停止 ------------------------------------------------------
+
+    def start_server(self) -> None:
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        if self._server_thread is not None and self._server_thread.isRunning():
+            return
+        if self._server_manager is not None and self._server_manager.any_running():
+            self._notify("warn", "服务器已在运行中")
+            return
+        if not cluster.has_token:
+            self._notify("error", f"{cluster.name} 缺少 cluster_token.txt，无法启动")
+            return
+
+        self.server_log_view.clear()
+        self.server_status_label.setText("正在启动…")
+        self.btn_server_start.setEnabled(False)
+        self.btn_server_stop.setEnabled(True)
+
+        update = self.server_update_mods.isChecked()
+        self._append_server_log(
+            f"[INFO] 启动 {cluster.name} · {cluster.cluster_name}"
+            f"（{'更新' if update else '跳过'}模组）")
+        extra = self.extra_args_input.text().split()
+        self._server_thread = ServerThread("start", cluster, update_mods=update,
+                                           extra_args=extra)
+        self._server_thread.started.connect(self._on_server_started)
+        self._server_thread.failed.connect(self._on_server_failed)
+        self._server_thread.finished.connect(self._on_server_thread_finished)
+        self._server_timer.start()
+        self._server_thread.start()
+
+    def _on_server_started(self, manager) -> None:
+        self._server_manager = manager
+        self.server_status_label.setText("运行中")
+        self._append_server_log("[OK] 全部分片已就绪")
+
+    def _on_server_failed(self, tb: str) -> None:
+        self.server_status_label.setText("启动失败")
+        self.btn_server_start.setEnabled(True)
+        self.btn_server_stop.setEnabled(False)
+        self._append_server_log(f"[FAIL] {tb}")
+        self._notify("error", "服务器启动失败，详见日志")
+
+    def _on_server_thread_finished(self) -> None:
+        if self._server_manager is None or not self._server_manager.any_running():
+            self.btn_server_start.setEnabled(True)
+            self.btn_server_stop.setEnabled(False)
+
+    def stop_server(self) -> None:
+        if self._server_manager is None:
+            return
+        attached = getattr(self._server_manager, "attached", False)
+        self._append_server_log(
+            "[INFO] 正在停止服务器…" + ("（接管的外部进程）" if attached else ""))
+        self._server_manager.stop_all()
+        self._server_manager = None
+        self._attached_pending = None
+        self._server_timer.stop()
+        self.server_status_label.setText("已停止")
+        self.btn_server_start.setEnabled(True)
+        self.btn_server_attach.setEnabled(False)
+        self.btn_server_stop.setEnabled(False)
+        self._append_server_log("[OK] 已停止")
+
+    def _pump_server_logs(self) -> None:
+        manager = getattr(self, "_server_manager", None)
+        if manager is None:
+            return
+        chunk = manager.pump_logs()
+        if chunk:
+            self.server_log_view.appendPlainText(chunk)
+        # 刷新分片状态行
+        parts = []
+        for s in manager.status():
+            state = "运行中" if s["running"] else "已停止"
+            if s["running"]:
+                state = "就绪" if s["ready"] else "启动中"
+            mark = "★" if s["is_master"] else " "
+            parts.append(f"{mark}{s['shard']} :{s['port']} · {state}")
+        self.server_shards_label.setText("　".join(parts))
+
+    def _append_server_log(self, text: str) -> None:
+        for line in text.splitlines():
+            self.server_log_view.appendPlainText(line)
 
     def _build_statusbar(self, parent: QVBoxLayout) -> None:
         row = QHBoxLayout()
@@ -1183,13 +1662,64 @@ class MainWindow(QMainWindow):
             self.hide()
             worker.finished.connect(self.close)
             return
+        # 关窗时若服务器在运行，无论本工具启动还是接管的，都先问用户怎么处理：
+        # 「停止并退出 / 只退出（服务器继续跑）/ 取消」。
+        manager = self._server_manager
+        if manager is not None and manager.any_running():
+            choice = self._ask_stop_server_on_close(
+                attached=bool(getattr(manager, "attached", False)))
+            if choice == "cancel":
+                event.ignore()
+                return
+            if choice == "stop":
+                manager.stop_all()
+            # "leave"：只退出，服务器继续跑（下次可用「接管」重新纳入管理）
         self._closing = True
         self._relay_timer.stop()
+        self._server_timer.stop()
+        if manager is not None:
+            self._server_manager = None
         thread = self.relay_thread
         if thread is not None and thread.isRunning():
             thread.stop()
             thread.wait(3000)
         event.accept()
+
+    def _ask_stop_server_on_close(self, *, attached: bool = False) -> str:
+        """关窗前确认服务器去留。返回 "stop" / "leave" / "cancel"。
+
+        attached=True 表示这是接管的外部服务器（用户自己起的），
+        文案会明确提示「停止」会结束那个外部进程。
+
+        离屏（自动化测试）下 QMessageBox 模态框会永久阻塞事件循环，
+        所以走默认行为：停止并退出（与旧行为一致，测试可控）。
+        """
+        if _is_offscreen():
+            return "stop"
+        box = QMessageBox(self)
+        box.setWindowTitle(config.APP_NAME)
+        box.setIcon(QMessageBox.Icon.Question)
+        if attached:
+            box.setText("检测到你接管的外部专用服务器仍在运行。关闭程序时要怎么处理？")
+            box.setInformativeText(
+                "注意：该服务器不是本工具启动的。「停止并退出」会结束那个外部进程；"
+                "「只退出」仅脱离监控，服务器继续跑。")
+        else:
+            box.setText("专用服务器仍在运行。关闭程序时要怎么处理？")
+            box.setInformativeText(
+                "「停止并退出」会先关停所有分片；"
+                "「只退出」让服务器继续跑，下次打开本工具可用「接管」重新管理。")
+        btn_stop = box.addButton("停止并退出", QMessageBox.ButtonRole.AcceptRole)
+        btn_leave = box.addButton("只退出（服务器继续跑）", QMessageBox.ButtonRole.DestructiveRole)
+        btn_cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_stop)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is btn_leave:
+            return "leave"
+        if clicked is btn_cancel:
+            return "cancel"
+        return "stop"
 
     # ------------------------------------------------------------------
     # 动作
