@@ -1,4 +1,13 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLDYK
+#
+# 本程序是自由软件：你可以遵照 GNU 通用公共许可证第 3 版
+# （GPL-3.0-only）的条款重新发布和/或修改它。
+#
+# 本程序基于「有用」的期望分发，但不提供任何担保；连适销性或
+# 特定用途适用性的默示担保也没有。完整条款见仓库根目录的
+# LICENSE 文件，或 <https://www.gnu.org/licenses/>。
 """DST 专用服务器管理：扫描本地存档、解析模组、拉起分片进程。
 
 只依赖标准库（winreg / subprocess / re / pathlib），与本项目其它模块保持一致。

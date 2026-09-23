@@ -1,4 +1,13 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 SLDYK
+#
+# 本程序是自由软件：你可以遵照 GNU 通用公共许可证第 3 版
+# （GPL-3.0-only）的条款重新发布和/或修改它。
+#
+# 本程序基于「有用」的期望分发，但不提供任何担保；连适销性或
+# 特定用途适用性的默示担保也没有。完整条款见仓库根目录的
+# LICENSE 文件，或 <https://www.gnu.org/licenses/>。
 """UDP 中继：把两段互相不可达的网络缝起来（纯转发，不改游戏一个字节）。
 
 背景
