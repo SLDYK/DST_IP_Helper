@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
 )
 
-from . import config, diagnostics, firewall, relay, server, winproc
+from . import config, diagnostics, firewall, netinfo, relay, server, winproc
 
 # ---------------------------------------------------------------------------
 # 主题
@@ -208,6 +208,18 @@ def _is_offscreen() -> bool:
         return False
 
 
+def split_address(address: str) -> tuple[str, str]:
+    """把 ``ip:port`` 拆成 ``(ip, port)``；未带端口时端口返回空串。"""
+    if not address:
+        return "", ""
+    if address.count(":") > 1:
+        return address, ""   # IPv6 字面量，不能按最后一个冒号拆
+    ip, sep, port = address.rpartition(":")
+    if not sep or not port.isdigit():
+        return address, ""
+    return ip, port
+
+
 # ---------------------------------------------------------------------------
 # 后台工作线程
 # ---------------------------------------------------------------------------
@@ -356,20 +368,59 @@ class ServerThread(QThread):
                 self.failed.emit(traceback.format_exc())
 
 
+class PublicAddressThread(QThread):
+    """后台查本机公网 IPv4（要发 HTTP 请求，不能阻塞界面）。
+
+    成功时 ``done(ip, 来源)``；失败时 ``done("", 失败原因)``。
+    """
+
+    done = pyqtSignal(str, str)
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            ip, source, via_proxy = netinfo.get_public_ip()
+        except Exception:  # noqa: BLE001 - 网络异常种类很多，统一兜住
+            self.done.emit("", f"查询公网地址出错：{traceback.format_exc(limit=1)}")
+            return
+        if not ip:
+            self.done.emit("", "没能查到公网地址（接口都被挡了）")
+            return
+        kind = netinfo.classify_ip(ip)
+        if kind == "public":
+            origin = (f"{source}，经系统代理，可能不是真实出口"
+                      if via_proxy else source)
+            self.done.emit(ip, origin)
+        elif kind == "cgnat":
+            self.done.emit(
+                "", f"出口地址 {ip} 属于运营商大内网（CGNAT），端口映射无效，请用「UDP 中继」页")
+        else:
+            self.done.emit("", f"出口地址 {ip} 不是公网地址（{kind}）")
+
+
 # ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
-    def __init__(self, auto_run: bool = True) -> None:
+    def __init__(self, auto_run: bool = False, auto_scan: bool | None = None) -> None:
+        """``auto_run=True`` 才会在窗口出现后自动跑网络检测（默认不跑）。
+
+        检测会联网、改本机防火墙/UPnP 配置且要十几秒，所以默认交给用户点
+        「开始检测并配置」触发；``auto_run`` 只留给自检这类特殊场景。
+        ``auto_scan`` 控制「开服」标签页是否自动扫描本机存档（纯本地只读），
+        默认跟随 ``auto_run``。
+        """
         super().__init__()
         self.report: diagnostics.Report | None = None
         self.worker: Worker | None = None
         self.relay_thread: RelayThread | None = None
         self._closing = False
         self._auto_run = auto_run
+        self._auto_scan = auto_run if auto_scan is None else auto_scan
         # 中继向导状态
         self._session = ""           # 本次主机/加入会话的校验值
         self._relay_ready = False    # 就绪检测是否全部通过
+        self._relay_checked_once = False  # 中继就绪自检是否已跑过（切页再跑）
+        self._relay_tab_index = 1
         self._host_info: dict | None = None  # 加入方解析出的主机码信息
         # 开服状态
         self._clusters: list = []
@@ -378,6 +429,10 @@ class MainWindow(QMainWindow):
         self._server_manager = None       # ServerManager 或 AttachedServer
         self._attached_pending = None     # 检测到待接管的 AttachedServer
         self._readiness_thread: ReadinessThread | None = None
+        # 开服页「加入指令」用的地址（本地/公网）
+        self._addr_probe_ip = ""
+        self._addr_probe_note = ""
+        self._public_addr_thread: PublicAddressThread | None = None
 
         self.setWindowTitle(f"{config.APP_NAME}  v{config.APP_VERSION}")
         self.resize(900, 640)
@@ -394,8 +449,11 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         main.addWidget(self.tabs, stretch=1)
         self.tabs.addTab(self._build_direct_tab(), "直连配置")
-        self.tabs.addTab(self._build_relay_tab(), "UDP 中继")
+        self._relay_tab_index = self.tabs.addTab(self._build_relay_tab(), "UDP 中继")
         self.tabs.addTab(self._build_server_tab(), "开服")
+        # 中继页的就绪自检要跑 netsh + 网络探测，启动时不做：
+        # 等用户真的切到那一页（或点「重新检测」）再跑。
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self._build_statusbar(main)
 
@@ -410,9 +468,12 @@ class MainWindow(QMainWindow):
         self._server_timer.setInterval(800)
         self._server_timer.timeout.connect(self._pump_server_logs)
 
-        # 窗口一出来就先跑一次检测；测试可关掉这个开关，避免离屏时也去碰真实网络
+        # 默认不自动检测：等用户点「开始检测并配置」。
+        # auto_run=True 时才在窗口出现后延迟触发（自检/回归用）。
         if self._auto_run:
             QTimer.singleShot(200, self.start_run)
+        else:
+            self._show_idle_state()
 
     # ------------------------------------------------------------------
     # 界面搭建
@@ -493,13 +554,13 @@ class MainWindow(QMainWindow):
         self.address_view = QLineEdit(objectName="addressView")
         self.address_view.setReadOnly(True)
         self.address_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.address_view.setText("检测中……")
+        self.address_view.setText("尚未检测")
         layout.addWidget(self.address_view)
 
         self.command_view = QLineEdit(objectName="commandView")
         self.command_view.setReadOnly(True)
         self.command_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.command_view.setPlaceholderText("控制台指令：检测中……")
+        self.command_view.setPlaceholderText("控制台指令：尚未检测")
         layout.addWidget(self.command_view)
 
         row = QHBoxLayout()
@@ -649,7 +710,7 @@ class MainWindow(QMainWindow):
         llay.addWidget(self.relay_log_view)
         bottom.addWidget(lcard, stretch=2)
 
-        self.refresh_relay_readiness()
+        self.relay_ready_view.setPlainText("尚未检测（切到本页会自动开始，也可点下面「重新检测」）")
         return tab
 
     def _build_host_panel(self) -> QWidget:
@@ -902,10 +963,15 @@ class MainWindow(QMainWindow):
         mlay.addWidget(self.mod_list)
         pick.addWidget(mcard, stretch=2)
 
-        # 第 2 步：启动 / 停止 + 状态
+        # 第 2 步：启动 / 停止 + 状态；第 3 步：明文显示的加入指令。
+        # 两者放在同一列，指令就跟在「启动」按钮下面，不用去别的标签页找。
         row = QHBoxLayout()
         row.setSpacing(10)
         body.addLayout(row)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        row.addLayout(left, stretch=1)
 
         acard, alay = self._card("第 2 步 · 启动专用服务器")
         arow = QHBoxLayout()
@@ -929,7 +995,32 @@ class MainWindow(QMainWindow):
         self.server_shards_label = QLabel("", objectName="checkDetail")
         self.server_shards_label.setWordWrap(True)
         alay.addWidget(self.server_shards_label)
-        row.addWidget(acard, stretch=1)
+        left.addWidget(acard)
+
+        # 第 3 步：明文显示的加入指令（直接发给朋友）
+        jcard, jlay = self._card("第 3 步 · 把加入指令发给朋友")
+        self.server_cmd_view = QLineEdit(objectName="commandView")
+        self.server_cmd_view.setReadOnly(True)
+        self.server_cmd_view.setPlaceholderText("选择存档后自动生成 c_connect 指令")
+        jlay.addWidget(self.server_cmd_view)
+        jrow = QHBoxLayout()
+        jrow.setSpacing(8)
+        self.btn_server_cmd_copy = QPushButton("复制指令")
+        self.btn_server_cmd_copy.clicked.connect(self.copy_server_command)
+        self.btn_server_cmd_copy.setEnabled(False)
+        jrow.addWidget(self.btn_server_cmd_copy)
+        self.btn_server_cmd_probe = QPushButton("获取公网地址")
+        self.btn_server_cmd_probe.setToolTip(
+            "查本机公网 IPv4 并换到指令里；跨网络联机需要它 + 端口映射")
+        self.btn_server_cmd_probe.clicked.connect(self.probe_server_address)
+        jrow.addWidget(self.btn_server_cmd_probe)
+        jrow.addStretch(1)
+        jlay.addLayout(jrow)
+        self.server_cmd_hint = QLabel("", objectName="checkDetail")
+        self.server_cmd_hint.setWordWrap(True)
+        jlay.addWidget(self.server_cmd_hint)
+        left.addWidget(jcard)
+        left.addStretch(1)
 
         # 服务器日志
         lcard, llay = self._card("服务器日志")
@@ -939,11 +1030,12 @@ class MainWindow(QMainWindow):
         llay.addWidget(self.server_log_view)
         row.addWidget(lcard, stretch=2)
 
-        # auto_run=False（离屏测试）时不自动扫描，避免后台线程去碰真实文件系统
-        if self._auto_run:
+        # auto_scan=False（离屏测试）时不自动扫描，避免后台线程去碰真实文件系统
+        if self._auto_scan:
             self.refresh_clusters()
         else:
             self.cluster_combo.addItem("（未扫描）", None)
+        self._refresh_server_join_command()
         return tab
 
     # -- 开服：扫描 -----------------------------------------------------------
@@ -1019,6 +1111,7 @@ class MainWindow(QMainWindow):
         self._append_server_log("[OK] 已接管运行中的服务器")
         self._server_timer.start()
         self._pump_server_logs()
+        self._refresh_server_join_command()
 
     def _on_cluster_changed(self, _index: int) -> None:
         cluster = self._current_cluster()
@@ -1027,6 +1120,7 @@ class MainWindow(QMainWindow):
             self.cluster_summary.setText("")
             self.mod_list.clear()
             self.server_shards_label.setText("")
+            self._refresh_server_join_command()
             return
         missing = cluster.missing_mods()
         token_mark = "✓ 有令牌" if cluster.has_token else "✗ 缺令牌"
@@ -1050,10 +1144,108 @@ class MainWindow(QMainWindow):
             self.server_status_label.setText("⚠ 有模组未下载，可用启动前更新模组补齐")
         else:
             self.server_status_label.setText("就绪，可以启动")
+        self._refresh_server_join_command()
 
     def _current_cluster(self):
         data = self.cluster_combo.currentData()
         return data if isinstance(data, server.ClusterInfo) else None
+
+    # -- 开服：加入指令 ---------------------------------------------------------
+
+    def _server_join_address(self) -> tuple[str, str]:
+        """挑一个写进 ``c_connect`` 的地址，返回 ``(ip, 说明)``。
+
+        优先用「获取公网地址」的结果（或「直连配置」页已跑出的检测结果），
+        否则退回本机局域网地址。**不联网**（公网查询在按钮/后台线程里做）。
+        """
+        if self._addr_probe_ip:
+            return self._addr_probe_ip, self._addr_probe_note
+        if self.report is not None:
+            ip, _ = split_address(self.report.shareable_ip)
+            if ip:
+                return ip, "「直连配置」页检测出的公网地址"
+            ip, _ = split_address(self.report.primary_address or self.report.lan_address)
+            if ip:
+                return ip, "「直连配置」页的检测结果"
+        ips = netinfo.get_local_ips()
+        if ips:
+            return ips[0], "本机局域网地址，同一个 WiFi 的朋友可用"
+        return "", "没能确定本机地址"
+
+    def _refresh_server_join_command(self) -> None:
+        """刷新开服页的加入指令（选存档、启停服务器后都要跟一下）。"""
+        cluster = self._current_cluster()
+        if cluster is None:
+            self.server_cmd_view.clear()
+            self.btn_server_cmd_copy.setEnabled(False)
+            self.server_cmd_hint.setText("先在上面选一个存档，这里会给出可发给朋友的指令。")
+            return
+        ip, note = self._server_join_address()
+        if not ip:
+            self.server_cmd_view.clear()
+            self.btn_server_cmd_copy.setEnabled(False)
+            self.server_cmd_hint.setText(note)
+            return
+        # 端口固定用主世界（10999）：客户端连不进洞穴分片
+        master = config.pick_master_port(cluster.ports())
+        self.server_cmd_view.setText(config.join_command(ip, master))
+        self.btn_server_cmd_copy.setEnabled(True)
+
+        running = (self._server_manager is not None
+                   and self._server_manager.any_running())
+        head = (f"地址 {ip}（{note}）；主世界端口 {master}。"
+                if running else
+                f"地址 {ip}（{note}）；主世界端口 {master}，服务器尚未运行，"
+                "朋友现在连不上。")
+        lines = [
+            head,
+            "朋友在主菜单按 ` 打开控制台，粘贴上面指令回车即可加入。",
+            "跨网络需公网地址 + 端口映射；双重 NAT / 只有 IPv6 请用「UDP 中继」页。",
+        ]
+        if self._addr_probe_note and not self._addr_probe_ip:
+            lines.insert(1, f"上次查询公网地址：{self._addr_probe_note}")
+        self.server_cmd_hint.setText("\n".join(lines))
+
+    def copy_server_command(self) -> None:
+        command = self.server_cmd_view.text().strip()
+        if not command:
+            self._notify("info", "还没有可复制的加入指令")
+            return
+        if winproc.set_clipboard_text(command):
+            self._set_status("加入指令已复制，发给朋友即可")
+            self._append_server_log(f"[OK] 加入指令已复制：{command}")
+        else:
+            self._notify("warn", "写入剪贴板失败，请手动选中复制")
+
+    def probe_server_address(self) -> None:
+        """查本机公网 IPv4 并换到加入指令里（后台线程，避免卡界面）。"""
+        if self._public_addr_thread is not None and self._public_addr_thread.isRunning():
+            return
+        if _is_offscreen():
+            # 离屏（自动化测试）不联网，避免拖慢测试 / 留下未结束的线程
+            self._append_server_log("[INFO] 离屏模式跳过公网地址查询")
+            return
+        self.btn_server_cmd_probe.setEnabled(False)
+        self._addr_probe_note = "正在查询…"
+        self._refresh_server_join_command()
+        thread = PublicAddressThread()
+        thread.done.connect(self._on_public_address)
+        thread.finished.connect(self._on_public_address_finished)
+        self._public_addr_thread = thread
+        thread.start()
+
+    def _on_public_address_finished(self) -> None:
+        self._public_addr_thread = None
+        self.btn_server_cmd_probe.setEnabled(True)
+
+    def _on_public_address(self, ip: str, note: str) -> None:
+        self._addr_probe_ip = ip
+        self._addr_probe_note = f"公网地址，来自 {note}" if ip else note
+        if ip:
+            self._append_server_log(f"[OK] 已获取公网地址 {ip}（来自 {note}）")
+        else:
+            self._append_server_log(f"[WARN] {note}")
+        self._refresh_server_join_command()
 
     # -- 开服：令牌与高级设置 ---------------------------------------------
 
@@ -1156,6 +1348,7 @@ class MainWindow(QMainWindow):
         self._server_manager = manager
         self.server_status_label.setText("运行中")
         self._append_server_log("[OK] 全部分片已就绪")
+        self._refresh_server_join_command()
 
     def _on_server_failed(self, tb: str) -> None:
         self.server_status_label.setText("启动失败")
@@ -1184,6 +1377,7 @@ class MainWindow(QMainWindow):
         self.btn_server_attach.setEnabled(False)
         self.btn_server_stop.setEnabled(False)
         self._append_server_log("[OK] 已停止")
+        self._refresh_server_join_command()
 
     def _pump_server_logs(self) -> None:
         manager = getattr(self, "_server_manager", None)
@@ -1257,6 +1451,21 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
 
+    def _show_idle_state(self) -> None:
+        """启动后、用户点击检测之前的初始界面（不做任何网络/系统动作）。"""
+        self._clear_checks()
+        hint = QLabel(
+            "尚未检测。\n\n点右侧「开始检测并配置」按钮开始。",
+            objectName="checkDetail",
+        )
+        hint.setWordWrap(True)
+        self.checks_layout.insertWidget(self.checks_layout.count() - 1, hint)
+        self.address_view.setText("尚未检测")
+        self.command_view.clear()
+        self.command_view.setPlaceholderText("控制台指令：尚未检测")
+        self.btn_copy_share.setEnabled(False)
+        self._set_status("就绪，等待开始检测")
+
     def _append_log(self, message: str) -> None:
         match = LEVEL_LINE_RE.match(message)
         color = LOG_COLORS.get(match.group(1), "#24292f") if match else "#24292f"
@@ -1282,6 +1491,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 中继：就绪检测 / 角色 / 码
     # ------------------------------------------------------------------
+    def _on_tab_changed(self, index: int) -> None:
+        """切到「UDP 中继」页时才跑就绪自检，避免启动即碰网络。"""
+        if index == self._relay_tab_index and not self._relay_checked_once:
+            self._relay_checked_once = True
+            self.refresh_relay_readiness()
+
     def refresh_relay_readiness(self) -> None:
         """在后台线程跑就绪自检（netsh + 自环探测是阻塞 IO）。"""
         if _is_offscreen():
@@ -1607,7 +1822,7 @@ class MainWindow(QMainWindow):
             # 必须连**主世界**端口（主机在主机码里告知），不能取最小端口 ——
             # DST 默认主世界 10999、洞穴 10998，连洞穴端口进不去。
             master = self._host_info["master_port"]
-            cmd = f'c_connect("127.0.0.1", {master})'
+            cmd = config.join_command("127.0.0.1", master)
             self.join_cmd_view.setText(cmd)
             self.btn_join_cmd_copy.setEnabled(True)
             local_ports = "、".join(
@@ -1786,6 +2001,11 @@ class MainWindow(QMainWindow):
         if readiness is not None and readiness.isRunning():
             readiness.wait(4000)
             self._readiness_thread = None
+        # 公网地址查询也是短任务，同样等它收尾再销毁窗口
+        probe = self._public_addr_thread
+        if probe is not None and probe.isRunning():
+            probe.wait(9000)
+            self._public_addr_thread = None
         if manager is not None:
             self._server_manager = None
         thread = self.relay_thread
@@ -2054,7 +2274,9 @@ def main() -> int:
     app.setApplicationName(config.APP_NAME)
     app.setStyleSheet(STYLE)
 
-    window = MainWindow()
+    # 启动即静默：不自动开始检测（检测要联网、还会改本机防火墙/UPnP 配置），
+    # 等用户点「开始检测并配置」。开服页的存档扫描是纯本地只读操作，照旧自动跑。
+    window = MainWindow(auto_scan=True)
     window.show()
     return app.exec()
 

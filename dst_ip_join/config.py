@@ -49,6 +49,16 @@ def pick_master_port(ports) -> int:
         return DEFAULT_MASTER_PORT
     return min(ports)
 
+
+def join_command(ip: str, port: int | str) -> str:
+    """饥荒控制台的直连指令，形如 ``c_connect("1.2.3.4", 10999)``。
+
+    朋友按 `` ` `` 打开控制台、粘贴回车即可加入，比在「浏览游戏」里填
+    IP:端口 可靠得多。直连、中继、开服三处都要用它，统一放这里一份。
+    """
+    return f'c_connect("{ip}", {port})'
+
+
 # 防火墙规则名前缀（删除自己加的规则时靠它识别，不会误删别人的）
 FIREWALL_RULE_PREFIX = "DST-IP-Join"
 UPNP_MAPPING_DESC_PREFIX = "DST-IP-Join"

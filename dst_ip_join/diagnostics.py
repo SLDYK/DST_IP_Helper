@@ -108,7 +108,7 @@ class Report:
         ip, _, port = address.rpartition(":")
         if not ip:
             ip, port = address, str(self.master_port)
-        return f'c_connect("{ip}", {port})'
+        return config.join_command(ip, port)
 
     @property
     def all_ports_mapped(self) -> bool:
@@ -600,7 +600,7 @@ def _build_share_text(report: Report) -> None:
     ip, _, port = address.rpartition(":")
     if not ip:
         ip, port = address, str(report.master_port)
-    command = report.connect_command or f'c_connect("{ip}", {port})'
+    command = report.connect_command or config.join_command(ip, port)
 
     lines = [
         "====== 饥荒联机版 直连信息 ======",

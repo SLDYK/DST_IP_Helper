@@ -43,8 +43,9 @@ class DstIpJoinApp:
         self._build_ui()
         self._poll_queue()
 
-        # 窗口一出来就先跑一次
-        self.root.after(200, self.start_run)
+        # 启动后不自动检测（检测要联网、还会改本机防火墙/UPnP 配置），
+        # 等用户点「开始检测并配置」再动作。
+        self._show_idle_state()
 
     # ------------------------------------------------------------------
     # 界面搭建
@@ -129,7 +130,7 @@ class DstIpJoinApp:
         box = ttk.LabelFrame(parent, text=" 把地址或指令发给朋友 ", padding=10)
         box.pack(fill="x", pady=(10, 0))
 
-        self.address_var = tk.StringVar(value="检测中……")
+        self.address_var = tk.StringVar(value="尚未检测")
         self.address_entry = tk.Entry(
             box,
             textvariable=self.address_var,
@@ -267,6 +268,20 @@ class DstIpJoinApp:
         for child in self.checks_frame.winfo_children():
             child.destroy()
         self._check_row = 0
+
+    def _show_idle_state(self) -> None:
+        """启动后、用户点击检测之前的初始界面（不做任何网络/系统动作）。"""
+        self._clear_checks()
+        ttk.Label(
+            self.checks_frame,
+            text="尚未检测，点「开始检测并配置」开始。",
+            foreground="#57606a",
+            font=(FONT_FAMILY, 10),
+        ).grid(row=0, column=1, columnspan=2, sticky="w", pady=2)
+        self.address_var.set("尚未检测")
+        self.command_var.set("")
+        self.btn_copy_share.state(["disabled"])
+        self._set_status("就绪，等待开始检测")
 
     def _add_check(self, item: diagnostics.CheckItem) -> None:
         row = self._check_row

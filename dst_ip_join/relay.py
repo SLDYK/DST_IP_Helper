@@ -1051,12 +1051,20 @@ def self_loop_probe(port: int, address: str | None = None,
                     timeout: float = 0.6) -> dict:
     """从本机经**公网地址**回连自己的中继端口。
 
-    ⚠️ 局限：本机自发自收可能走系统内部优化，**不能证明外部入站可达**。
-    但它能验证很有价值的三件事：端口真的绑上了、防火墙规则对本机也生效、
-    地址与端口这一对是自洽的。
+    ⚠️ 局限（实测验证）：向**本机自己的地址**发包时，Windows 大概率走
+    内核内部回环 —— 实测 RTT 为 **0.0ms**，说明包完全绕开了网卡、
+    Windows 防火墙、路由器、光猫。所以它**不能证明外网入站可达**。
+    （网络位在本机路由表里被判定为 local，协议栈直接回环，不上网卡。）
+
+    它真正能验证的是：端口真的绑上了、地址与端口这一对是自洽的、
+    socket 确实在收包。
 
     结果里的 ``denied`` 要当作**好消息**：说明包到达了中继（路径通），
     只是本机地址不在白名单里 —— 主机自己本来就不需要加入码。
+
+    请通过 ``rtt_ms`` 判断走的哪条路：< 0.5ms 即为内部回环。
+    真正的外部可达性只能由**加入方发起的连通性测试**证明（那个是双向的：
+    对方包出得去 + 我们收得到 + 我们的回包也回得去）。
     """
     globals_v6 = global_ipv6_addresses()
     target = address or (globals_v6[0] if globals_v6 else None)
@@ -1109,7 +1117,7 @@ def check_host_readiness(
         missing = [p for p in ports if not firewall.rule_exists(p)]
         if not missing:
             results.append((True, "ok",
-                            f"防火墙已放行：" + "、".join(f"UDP {p}" for p in ports)))
+                            "防火墙已放行：" + "、".join(f"UDP {p}" for p in ports)))
         else:
             results.append(
                 (False, "warn",
@@ -1153,17 +1161,33 @@ def check_host_readiness(
         )
 
     # 7. 自环可达（经公网地址回连自己的中继端口）
+    #
+    # ⚠️ 这一步的价值容易被高估：向**本机自己的地址**发包时，Windows 可能走
+    # 内核内部回环（实测 RTT 0.0ms），完全绕开网卡 / 防火墙 / 路由器 / 光猫。
+    # 所以它**只能证明「端口绑上了」**，不能证明外网能连进来。
+    # 用 RTT 自动区分这两种情况，把话说清楚，避免用户误判。
     if loopback:
         got = self_loop_probe(ports[0], timeout=loopback_timeout)
         status = got.get("status")
         addr = got.get("address", "-")
+        rtt = got.get("rtt_ms")
         if status == "ok":
-            results.append((True, "ok", f"自环测试：经 {addr} 回连成功"))
+            if rtt is not None and rtt < 0.5:
+                results.append(
+                    (True, "ok",
+                     f"自环测试：{addr} 回连成功（{rtt}ms，本机内部回环）"
+                     f" —— 只证明端口已绑定，**不能证明外网可达**")
+                )
+            else:
+                results.append(
+                    (True, "ok",
+                     f"自环测试：{addr} 回连成功（{rtt}ms，经过真实网卡）")
+                )
         elif status == "denied":
             # 主机自己不在白名单里，这是预期行为 —— 关键证明「包能到中继」
             results.append(
                 (True, "ok",
-                 f"自环测试：经 {addr} 包已到达中继（被白名单拒，属预期 —— "
+                 f"自环测试：{addr} 包已到达中继（被白名单拒，属预期 —— "
                  f"主机自己不需要加入码）")
             )
         elif status == "refused":
@@ -1174,11 +1198,20 @@ def check_host_readiness(
         elif status == "timeout":
             results.append(
                 (False, "warn",
-                 f"自环测试：经 {addr} 无响应 —— 可能被防火墙拦住本机入站，"
+                 f"自环测试：{addr} 无响应 —— 可能被防火墙拦住本机入站，"
                  f"或该地址不可用")
             )
         else:
             results.append((False, "warn", f"自环测试：{addr} → {status}"))
+
+        # 8. 关键引导：外部可达性只能由加入方证明。
+        # 主机自环被证明会走内部回环（RTT 0.0ms），测不出入站策略，
+        # 所以必须在界面上把「让朋友测」这件事说清楚，否则主机会误以为万事俱备。
+        results.append(
+            (True, "ok",
+             "外部可达性以**加入方**的测试为准：请朋友用「连通性测试」探测你的"
+             "主机码。他显示 ✅ 才是双向全通（这一段本机自环测不出来）")
+        )
 
     return results
 

@@ -322,7 +322,7 @@ else:
         import os as _os
 
         _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from dst_ip_join import gui_qt  # noqa: E402
+        from dst_ip_join import gui_qt, server  # noqa: E402
 
         _qt_app = QApplication.instance() or QApplication(sys.argv)
         # auto_run=False：离屏测试不碰真实网络诊断（否则会卡十几秒）
@@ -344,6 +344,10 @@ else:
                     "server_status_label",
                     "server_shards_label",
                     "server_log_view",
+                    "server_cmd_view",
+                    "btn_server_cmd_copy",
+                    "btn_server_cmd_probe",
+                    "server_cmd_hint",
                 )
             ),
         )
@@ -370,6 +374,51 @@ else:
         # 关窗服务器确认：离屏下必须走默认（停止），绝不弹模态框
         check("关窗服务器确认在离屏下走默认（停止）",
               _qt_win._ask_stop_server_on_close() == "stop")
+
+        # 开服页的加入指令（明文显示）
+        check("split_address 拆分 IPv4:端口",
+              gui_qt.split_address("1.2.3.4:10999") == ("1.2.3.4", "10999"))
+        check("split_address 不拆 IPv6 字面量",
+              gui_qt.split_address("2409:8a60::1") == ("2409:8a60::1", ""))
+        check("未选存档时不给加入指令",
+              _qt_win.server_cmd_view.text() == ""
+              and not _qt_win.btn_server_cmd_copy.isEnabled())
+        check("未选存档时提示去选存档",
+              "选一个存档" in _qt_win.server_cmd_hint.text())
+
+        # 造一个测试存档：洞穴 10998 + 主世界 10999，指令必须用主世界端口
+        _fake_cluster = server.ClusterInfo(
+            name="Cluster_Test",
+            path=Path("Cluster_Test"),
+            ownerdir=Path("0"),
+            shards=[
+                server.ShardInfo("Caves", False, 10998, Path("Cluster_Test")),
+                server.ShardInfo("Master", True, 10999, Path("Cluster_Test")),
+            ],
+            cluster_name="测试存档",
+            has_token=True,
+        )
+        _qt_win.cluster_combo.addItem("测试存档", _fake_cluster)
+        _qt_win.cluster_combo.setCurrentIndex(_qt_win.cluster_combo.count() - 1)
+        _cmd = _qt_win.server_cmd_view.text()
+        check("开服页明文显示加入指令",
+              _cmd.startswith('c_connect("') and _cmd.endswith(")"), _cmd)
+        check("加入指令用主世界端口 10999（不是洞穴 10998）",
+              _cmd.endswith(", 10999)"), _cmd)
+        check("开服页复制按钮已启用", _qt_win.btn_server_cmd_copy.isEnabled())
+        check("加入指令提示引导到中继页",
+              "UDP 中继" in _qt_win.server_cmd_hint.text())
+        check("服务器未运行时提醒朋友连不上",
+              "尚未运行" in _qt_win.server_cmd_hint.text())
+
+        # 启动时不碰网络：中继就绪自检要等切到那一页才跑
+        check("启动时不自动跑中继就绪自检",
+              not _qt_win._relay_checked_once and _qt_win._readiness_thread is None)
+        check("中继页初始显示尚未检测",
+              "尚未检测" in _qt_win.relay_ready_view.toPlainText())
+        _qt_win.tabs.setCurrentIndex(_qt_win._relay_tab_index)
+        check("切到中继页才跑就绪自检", _qt_win._relay_checked_once)
+
         _qt_win.close()
         check("PyQt6 中继窗口能干净关闭", True)
     except Exception as exc:  # noqa: BLE001
@@ -425,6 +474,13 @@ check("主世界端口选 10999，而不是最小的 10998",
 check("只有洞穴时退回最小值", config.pick_master_port([10998]) == 10998)
 check("端口改了也能选出结果", config.pick_master_port([20000, 30000]) == 20000)
 check("空端口列表不报错", config.pick_master_port([]) == config.DEFAULT_MASTER_PORT)
+
+# 直连指令统一由 config.join_command 生成（直连页 / 中继页 / 开服页共用一份）
+check("join_command 生成 c_connect 指令",
+      config.join_command("1.2.3.4", 10999) == 'c_connect("1.2.3.4", 10999)',
+      config.join_command("1.2.3.4", 10999))
+check("join_command 接受字符串端口",
+      config.join_command("127.0.0.1", "10999") == 'c_connect("127.0.0.1", 10999)')
 
 # 主机码必须携带主世界端口（加入方无法自行判断）。
 # 旧版码没有该字段，只能退回 min() —— 这是兼容分支，不该出现在新码里。
