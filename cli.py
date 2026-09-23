@@ -33,8 +33,14 @@ def _bootstrap() -> None:
 def _fix_console_encoding() -> None:
     """中文 Windows 控制台是 GBK，遇到生僻字符会抛 UnicodeEncodeError。"""
     for stream in (sys.stdout, sys.stderr):
+        # 用 getattr 探测而非直接 stream.reconfigure：sys.stdout 的标注是
+        # typing.TextIO，它并不声明该方法（真实类型 io.TextIOWrapper 才有，
+        # 从 3.7 起就有），而无控制台时 sys.stdout 还可能是 None。
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
         try:
-            stream.reconfigure(errors="replace")
+            reconfigure(errors="replace")
         except Exception:
             pass
 
@@ -236,8 +242,8 @@ def main(argv: list[str] | None = None) -> int:
             if missing:
                 mods += f"（{len(missing)} 个未下载）"
             token = "有令牌" if c.has_token else "缺令牌"
-            ports = "/".join(str(p) for p in c.ports()) or "?"
-            print(f"  {c.name:<12} {c.cluster_name}  端口 {ports}  {mods}  {token}")
+            port_text = "/".join(str(p) for p in c.ports()) or "?"
+            print(f"  {c.name:<12} {c.cluster_name}  端口 {port_text}  {mods}  {token}")
             for m in c.mods:
                 mark = "" if m.installed else "  ✗未下载"
                 print(f"      - {m.display_name}{mark}")
