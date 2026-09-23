@@ -566,6 +566,7 @@ class ShardProcess:
         self._ready = False
         self._reader: threading.Thread | None = None
         self._started_pid: int | None = None
+        self._stdin_lock = threading.Lock()
 
     def _build_args(self, game_dir: Path, ugc_dir: Path, update_mods: bool,
                     extra_args: list[str] | None) -> list[str]:
@@ -599,6 +600,10 @@ class ShardProcess:
         args.append("-only_update_server_mods" if update_mods else "-skip_update_server_mods")
         if extra_args:
             args.extend(extra_args)
+        # 服务器控制台：console_enabled=false 时 -console 也能把输入通道打开
+        # （exe 原文：'-console has been deprecated: Use the [MISC] / console_enabled
+        # setting instead.'——只是弃用警告，功能仍生效；不传时受 console_enabled 门控）
+        args.append("-console")
         return args
 
     @property
@@ -618,6 +623,7 @@ class ShardProcess:
         self.proc = subprocess.Popen(
             self.args,
             cwd=str(self.cwd),
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -657,6 +663,29 @@ class ShardProcess:
                 except subprocess.TimeoutExpired:
                     pass
         self.proc = None
+
+    def send_command(self, command: str) -> tuple[bool, str]:
+        """向该分片的 stdin 写一行 Lua 指令（需要 -console 启动）。
+
+        返回 ``(是否成功, 说明)``。注意 nullrenderer **不回显**输入行，
+        指令产生的输出会稍后出现在 stdout 里（由 pump() 读走）。
+        """
+        command = (command or "").strip()
+        if not command:
+            return False, "指令为空"
+        proc = self.proc
+        if proc is None or not self.alive:
+            return False, f"{self.shard.name} 未在运行"
+        stdin = proc.stdin
+        if stdin is None:
+            return False, "stdin 不可用（不是本工具启动的进程？）"
+        try:
+            with self._stdin_lock:
+                stdin.write(command + "\n")
+                stdin.flush()
+        except (OSError, ValueError) as exc:
+            return False, f"写入失败：{exc}"
+        return True, f"→ {self.shard.name}: {command}"
 
     def pump(self) -> str:
         """读取日志增量（非阻塞），返回新增文本。"""
@@ -764,6 +793,25 @@ class ServerManager:
                         parts.append(f"[{proc.shard.name}] {line}")
         return "\n".join(parts)
 
+    def send_command(self, command: str, shard: str = "") -> tuple[bool, str]:
+        """向指定分片（默认主世界）的 stdin 发送 Lua 指令。
+
+        返回 ``(是否成功, 说明)``。失败原因通常是「没在运行」或
+        「该分片不是本工具启动的（没有 stdin）」。
+        """
+        command = (command or "").strip()
+        if not command:
+            return False, "指令为空"
+        proc = (next((p for p in self.procs if p.shard.name == shard), None)
+                if shard else self.master_proc())
+        if proc is None:
+            names = "、".join(p.shard.name for p in self.procs)
+            return False, f"没有叫 {shard!r} 的分片（现有：{names}）"
+        return proc.send_command(command)
+
+    def master_proc(self) -> ShardProcess | None:
+        return next((p for p in self.procs if p.shard.is_master), None)
+
     def status(self) -> list[dict]:
         return [{
             "shard": p.shard.name,
@@ -831,6 +879,224 @@ def write_token(cluster: ClusterInfo, token: str) -> Path:
     dest.write_bytes(data)
     cluster.has_token = True
     return dest
+
+
+# ---------------------------------------------------------------------------
+# 服务器控制台（stdin 远程指令）
+# ---------------------------------------------------------------------------
+
+def console_enabled(cluster: ClusterInfo) -> bool:
+    """该存档的 ``cluster.ini`` 是否开了 ``[MISC] console_enabled``。
+
+    只有开了它，专用服务器才受理从 stdin 进来的 Lua 指令
+    （本工具启动时会补传 ``-console``，两道门都打开才稳）。
+    """
+    try:
+        ini = _parse_ini(_read(cluster.path / "cluster.ini"))
+    except OSError:
+        return False
+    return ini.get("misc.console_enabled", "").strip().lower() == "true"
+
+
+def enable_console(cluster: ClusterInfo) -> tuple[bool, str]:
+    """给存档的 ``cluster.ini`` 补写 ``[MISC] console_enabled = true``。
+
+    - 已开启 → ``(True, "已开启")``，文件不动；
+    - 已有 ``[MISC]`` 段 → 段末插一行；
+    - 没有 → 文件末尾追加整段。
+    写前会先备份为 ``cluster.ini.bak``。返回 ``(是否成功, 说明)``。
+    """
+    ini_path = cluster.path / "cluster.ini"
+    try:
+        text = _read(ini_path)
+    except OSError as exc:
+        return False, f"读取 cluster.ini 失败：{exc}"
+
+    lines = text.splitlines()
+    misc_idx = None
+    for i, raw in enumerate(lines):
+        if raw.strip().lower() == "[misc]":
+            misc_idx = i
+            break
+
+    if misc_idx is not None:
+        # 段内是否已有 console_enabled（大小写不敏感）
+        found = False
+        for i in range(misc_idx + 1, len(lines)):
+            stripped = lines[i].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                break  # 进入下一个段
+            if stripped.lower().startswith("console_enabled"):
+                if stripped.split("=", 1)[-1].strip().lower() == "true":
+                    return True, "已开启"
+                lines[i] = "console_enabled = true"
+                found = True
+                break
+        if not found:
+            # 插到该段**真正的末尾**（下一个段头或空行前的最后一个键之后），
+            # 而不是段头下面一行 —— 紧贴段头插入会把段内已有键挤到后面，
+            # 视觉上像键属于别的段；对 INI 解析无碍，但 diff 阅读体验差。
+            insert_at = misc_idx + 1
+            for i in range(misc_idx + 1, len(lines)):
+                stripped = lines[i].strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    break
+                if stripped:
+                    insert_at = i + 1
+            lines.insert(insert_at, "console_enabled = true")
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("[MISC]")
+        lines.append("console_enabled = true")
+
+    new_text = "\n".join(lines) + "\n"
+    try:
+        backup = ini_path.with_suffix(".ini.bak")
+        backup.write_text(text, encoding="utf-8")
+        ini_path.write_text(new_text, encoding="utf-8")
+    except OSError as exc:
+        return False, f"写入 cluster.ini 失败：{exc}"
+    return True, "已补写 console_enabled = true（备份为 cluster.ini.bak）"
+
+
+# ---------------------------------------------------------------------------
+# 玩家名单（blocklist.txt / adminlist.txt）：每行一个 Klei 用户 ID
+# ---------------------------------------------------------------------------
+
+# Klei 用户 ID：KU_ 前缀 + 一段非空白字符（可能是中文等任意字符）
+_BLOCKLIST_RE = re.compile(r"^KU_\S+$")
+
+
+def parse_player_lines(text: str) -> list[dict]:
+    """从服务器日志文本里抠出 ``c_listallplayers()`` 打印的玩家行。
+
+    输出格式（consolecommands.lua:291）：``[1] (KU_abCd1234) 玩家名 <角色prefab>``；
+    界面日志泵会给行加上分片前缀（``[Master] [1] (...) ...``），所以容忍任意多个
+    ``[xxx]`` 前缀；玩家名可能含任意字符，按「] (」与「) <」锚点切。
+    """
+    players: list[dict] = []
+    for line in text.splitlines():
+        m = _PLAYER_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        players.append({
+            "index": int(m.group(1)),
+            "userid": m.group(2),
+            "name": m.group(3),
+            "prefab": m.group(4),
+        })
+    return players
+
+
+# 解析玩家行：[分片前缀]* [时间戳]:? [序号] (用户ID) 玩家名 <角色prefab>
+# 实测（2026-09-23，用户真实服务器）：
+#   [Master] [00:07:09]: [1] (OU_76561199032098747) SLDYK <wortox>
+# 要点：① ID 前缀不止 KU_，还有 OU_（Steam 数字 ID 换算）等，别按前缀白名单；
+#      ② 时间戳后面有冒号；③ 行尾可能有制表符。
+_PLAYER_LINE_RE = re.compile(
+    r"^(?:\[[^\]]*\]\s*:?)*\s*\[(\d+)\]\s*\(([^()]+)\)\s*(.*?)\s*<([^<>]+)>\s*$")
+
+
+# ---------------------------------------------------------------------------
+# 服务器暂停/继续（TheSim:SetTimeScale）
+# ---------------------------------------------------------------------------
+
+# 🔴 为什么不是 TheNet:SetServerPaused：那是「客户端暂停菜单」的语义开关，
+# 在专用服务器上执行后世界照跑（2026-09-23 用户实测：连发三次，
+# RemoteCommandInput 确认送达且无报错，但没有任何 Sim paused/unpaused 转换）。
+# 专用服务器真正的暂停 = 时间刻度 0；引擎的 pause_when_empty 自动暂停就是
+# 这么实现的，切换时引擎自己会打印 `Sim paused` / `Sim unpaused`。
+PAUSE_ON_CMD = "TheSim:SetTimeScale(0)"
+PAUSE_OFF_CMD = "TheSim:SetTimeScale(1)"
+# 状态未知时的切换：单条表达式取反（老坑：两条语句挤一行没有分隔符 =
+# Lua 语法错误，指令根本不执行）。
+PAUSE_TOGGLE_CMD = "TheSim:SetTimeScale(TheSim:GetTimeScale() > 0 and 0 or 1)"
+
+# 状态打点前缀。服务器**不回显**输入行，暂停是否生效只能让游戏自己 print
+# 出当前时间刻度（0 = 已暂停）。世界暂停时 stdin 控制台仍会处理指令（实测）。
+SIM_TIMESCALE_PREFIX = "DSTIPJ_SIM_TS="
+SIM_TIMESCALE_PROBE_TEMPLATE = (
+    f'print("{SIM_TIMESCALE_PREFIX}" .. tostring(TheSim:GetTimeScale()))')
+
+_SIM_TIMESCALE_RE = re.compile(
+    re.escape(SIM_TIMESCALE_PREFIX) + r"\s*([0-9.eE+-]+)")
+_SIM_ENGINE_RE = re.compile(r"\bSim (un)?paused\b")
+
+
+def parse_sim_timescale(text: str) -> float | None:
+    """日志文本里最近一条时间刻度打点的值；没有打点返回 None。"""
+    value: float | None = None
+    for m in _SIM_TIMESCALE_RE.finditer(text):
+        try:
+            value = float(m.group(1))
+        except ValueError:
+            continue
+    return value
+
+
+def parse_pause_state(text: str) -> bool | None:
+    """从日志文本解析「世界模拟是否暂停」。
+
+    两种来源，按文本顺序取**最后**一条：
+    - 打点行 ``DSTIPJ_SIM_TS=<值>``：0 = 暂停，非 0 = 运行；
+    - 引擎原生行 ``Sim paused`` / ``Sim unpaused``（含 pause_when_empty
+      人数清空时的自动暂停：最后一名玩家退出会打出 Sim paused）。
+    没有任何线索时返回 None（调用方保持现有状态、按钮保持中性文案）。
+    """
+    value: bool | None = None
+    for line in text.splitlines():
+        m = _SIM_TIMESCALE_RE.search(line)
+        if m is not None:
+            try:
+                value = float(m.group(1)) == 0.0
+                continue
+            except ValueError:
+                pass
+        em = _SIM_ENGINE_RE.search(line)
+        if em is not None:
+            value = em.group(1) is None  # 没有 un 前缀 = paused
+    return value
+
+
+_ENGINE_TS_RE = re.compile(r"\[(\d{1,2}):([0-5]?\d):([0-5]?\d)\]")
+
+
+def engine_timestamp(line: str) -> int | None:
+    """引擎日志行 ``[HH:MM:SS]:`` 的时间戳（换算成秒）；没有返回 None。
+
+    容忍日志泵加的 ``[Master]`` 分片前缀（分片名不含数字冒号，不会误配）。
+    用途：日志视图有块数上限、旧内容会被驱逐，文本长度不单调，
+    「这条回显是否发生在发指令之后」只能靠引擎时间戳判断。
+    """
+    m = _ENGINE_TS_RE.search(line)
+    if m is None:
+        return None
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+def add_blocklist_userid(cluster: ClusterInfo, userid: str) -> tuple[bool, str]:
+    """把一个 Klei 用户 ID 追加进存档根的 ``blocklist.txt``（去重，幂等）。
+
+    DST 服务器在玩家加入时校验 blocklist：名单内用户直接拒连。
+    只追加不删除（清理黑名单让用户自己编辑文件）。返回 ``(是否新增, 说明)``。
+    """
+    userid = (userid or "").strip()
+    if not _BLOCKLIST_RE.match(userid):
+        return False, f"不像合法的 Klei 用户 ID：{userid!r}"
+    path = cluster.path / "blocklist.txt"
+    try:
+        existing = path.read_text(encoding="utf-8", errors="replace").splitlines() \
+            if path.is_file() else []
+        if userid in {line.strip() for line in existing}:
+            return True, f"{userid} 已在黑名单里"
+        with path.open("a", encoding="utf-8") as f:
+            if existing and existing[-1].strip():
+                f.write("\n")
+            f.write(userid + "\n")
+    except OSError as exc:
+        return False, f"写入 blocklist.txt 失败：{exc}"
+    return True, f"已把 {userid} 写入黑名单（下次连接即拒）"
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1371,11 @@ class AttachedServer:
             "pid": s.proc_info.pid,
             "attached": True,
         } for s in self.shards]
+
+    def send_command(self, command: str, shard: str = "") -> tuple[bool, str]:
+        """接管的外部进程拿不到 stdin，指令一律拒绝（说清楚原因）。"""
+        return False, "接管的外部服务器无法接收指令（stdin 不在本工具手里）\n" \
+                      "请在它自己的控制台窗口输入，或改用本工具启动服务器"
 
     def stop_all(self) -> None:
         # 先停次级分片，最后停 Master

@@ -164,32 +164,75 @@ def _target_is_loopback(host: str) -> bool:
 
 
 class AddressAllowList:
-    """来源地址白名单。支持单个地址或 CIDR，例如 ``2001:db8::1`` / ``2409:8a60::/32``。"""
+    """来源地址白名单。支持单个地址或 CIDR，例如 ``2001:db8::1`` / ``2409:8a60::/32``。
 
-    def __init__(self, entries: list[str] | None = None) -> None:
-        self._networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-        self._allow_any = False
-        for entry in entries or []:
+    三种守门状态：
+      * **关闭**（``closed=True``）—— 拒绝所有人。主机还没加任何加入码时
+        用它守门：中继可以先跑起来（端口绑定、防火墙放行、探测应答都正常），
+        但任何外部加入都被拒，等加入码来了再放行；
+      * **过滤**（有条目）—— 只放行列出的地址 / 网段；
+      * **开放**（条目为空且未 closed）—— 不限制（``--allow`` 不传时的旧行为）。
+
+    ``set_entries`` / ``set_closed`` 可以在**中继运行中**整体替换状态：
+    内部把全部状态存成单个不可变元组，靠 CPython 引用赋值的原子性做
+    无锁热更新（中继线程每个包都要查 ``allows``，不能上重锁）。
+    """
+
+    def __init__(self, entries: list[str] | None = None, *, closed: bool = False) -> None:
+        self._state: tuple[str, tuple] = ("closed", ()) if closed else self._compile(entries or [])
+
+    @staticmethod
+    def _compile(entries: list[str]) -> tuple[str, tuple]:
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        allow_any = False
+        for entry in entries:
             text = entry.strip()
             if not text:
                 continue
             if text.lower() in ("any", "*", "all"):
-                self._allow_any = True
+                allow_any = True
                 continue
             try:
-                self._networks.append(ipaddress.ip_network(text, strict=False))
+                networks.append(ipaddress.ip_network(text, strict=False))
             except ValueError as exc:
                 raise ValueError(f"白名单条目无法解析：{entry!r}（{exc}）") from None
+        if allow_any:
+            return ("open", ())
+        if networks:
+            return ("filter", tuple(networks))
+        # 旧行为：条目为空 = 不限制（CLI 不传 --allow 时就是无白名单）
+        return ("open", ())
 
+    # ---------------------------------------------------------- 热更新
+    def set_entries(self, entries: list[str] | None, *, closed: bool = False) -> None:
+        """运行中整体替换白名单（线程安全：单个引用原子交换）。
+
+        ``closed=True`` 或条目解析后为空且 closed → 切到「拒绝所有人」。
+        注意：条目为空但 ``closed=False`` 会切到「不限制」（旧行为），
+        GUI 侧同步加入码时必须传 ``closed=not entries``。
+        """
+        self._state = ("closed", ()) if closed else self._compile(entries or [])
+
+    def set_closed(self) -> None:
+        """切到「拒绝所有人」（例如删光了所有生效加入码）。"""
+        self._state = ("closed", ())
+
+    # ------------------------------------------------------------ 查询
     @property
     def is_open(self) -> bool:
         """没有任何限制（等于不设防）。"""
-        return self._allow_any or not self._networks
+        return self._state[0] == "open"
+
+    @property
+    def is_closed(self) -> bool:
+        """拒绝所有人（还没放行任何加入码的守门状态）。"""
+        return self._state[0] == "closed"
 
     def allows(self, host: str) -> bool:
-        if self._allow_any:
-            return True
-        if not self._networks:
+        mode, networks = self._state
+        if mode == "closed":
+            return False
+        if mode == "open":
             return True
         try:
             addr = ipaddress.ip_address(host.split("%", 1)[0])
@@ -197,7 +240,7 @@ class AddressAllowList:
             return False
         # IPv4-mapped IPv6（::ffff:1.2.3.4）按内层的 IPv4 再判一次
         mapped = getattr(addr, "ipv4_mapped", None)
-        for net in self._networks:
+        for net in networks:
             if addr in net:
                 return True
             if mapped is not None and mapped in net:
@@ -205,12 +248,12 @@ class AddressAllowList:
         return False
 
     def describe(self) -> str:
-        if self.is_open:
+        mode, networks = self._state
+        if mode == "closed":
+            return "已关闭（尚未放行任何加入码：所有外部加入都被拒绝）"
+        if mode == "open":
             return "不限制（任何人都能连）"
-        parts = [str(n) for n in self._networks]
-        if self._allow_any:
-            parts.append("any")
-        return "、".join(parts)
+        return "、".join(str(n) for n in networks)
 
 
 # ==========================================================================
@@ -1144,7 +1187,8 @@ def check_host_readiness(
     if not entries:
         results.append(
             (False, "warn",
-             "还没有任何加入码：朋友连进来会被全部拒绝。"
+             "还没有生效的加入码：现在启动中继也可以，但所有加入会被拒绝；"
+             "添加加入码后立即生效（不用重启中继）。"
              "请在「第 4 步」粘贴朋友发来的 JOIN… 码")
         )
     elif not active:

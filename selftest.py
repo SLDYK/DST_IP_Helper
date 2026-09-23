@@ -348,6 +348,10 @@ else:
                     "btn_server_cmd_copy",
                     "btn_server_cmd_probe",
                     "server_cmd_hint",
+                    "server_cmd_input",
+                    "server_cmd_target",
+                    "btn_server_cmd_send",
+                    "btn_console_fix",
                 )
             ),
         )
@@ -418,6 +422,28 @@ else:
               "尚未检测" in _qt_win.relay_ready_view.toPlainText())
         _qt_win.tabs.setCurrentIndex(_qt_win._relay_tab_index)
         check("切到中继页才跑就绪自检", _qt_win._relay_checked_once)
+
+        # 服务器控制台：初始未运行 → 输入禁用 + 引导占位；Cluster_2 已开 console_enabled
+        check("控制台初始下拉显示未运行",
+              _qt_win.server_cmd_target.currentText() == "未运行",
+              _qt_win.server_cmd_target.currentText())
+        check("控制台初始按钮/输入禁用",
+              not _qt_win.btn_server_cmd_send.isEnabled()
+              and not _qt_win.server_cmd_input.isEnabled())
+        check("控制台初始占位引导启动",
+              "启动服务器后" in _qt_win.server_cmd_input.placeholderText(),
+              _qt_win.server_cmd_input.placeholderText())
+        # 一键常用指令：初始全部禁用，按钮集与定义一致
+        check("一键指令按钮与定义一致",
+              [b.text() for b in _qt_win.quick_cmd_buttons.values()]
+              == [q[1] for q in _qt_win.QUICK_COMMANDS],
+              str([b.text() for b in _qt_win.quick_cmd_buttons.values()]))
+        check("一键指令按钮初始禁用",
+              not any(b.isEnabled() for b in _qt_win.quick_cmd_buttons.values()))
+        # 暂停/继续按钮：初始中性「暂停世界」（状态未知），不在回档确认名单里
+        check("暂停按钮初始文案为暂停世界",
+              _qt_win.quick_cmd_buttons["pause"].text() == "暂停世界",
+              _qt_win.quick_cmd_buttons["pause"].text())
 
         _qt_win.close()
         check("PyQt6 中继窗口能干净关闭", True)
@@ -592,6 +618,103 @@ finally:
 
 
 # ==========================================================================
+print("\n== 12b. 空白名单启动 + 运行中热更新白名单（closed 守门）==")
+
+# AddressAllowList 三态语义
+check("closed=True → 拒绝所有人", not relay.AddressAllowList([], closed=True).allows("::1"))
+check("closed 状态下 describe 提示未放行",
+      "拒绝" in relay.AddressAllowList([], closed=True).describe())
+_open_list = relay.AddressAllowList([])
+check("空条目（未 closed）仍是旧行为 = 不限制", _open_list.allows("1.2.3.4"))
+check("is_open 只认开放态", _open_list.is_open
+      and not relay.AddressAllowList([], closed=True).is_open)
+check("is_closed 只认关闭态", relay.AddressAllowList([], closed=True).is_closed
+      and not _open_list.is_closed)
+_filter_list = relay.AddressAllowList(["2001:db8::/32"])
+check("有条目 = 过滤态", not _filter_list.is_open and not _filter_list.is_closed)
+
+# 热更新：closed → 放行 → 关闭，引用同一实例
+_hot = relay.AddressAllowList([], closed=True)
+check("热更新前：包被拒", not _hot.allows("2409:8a60::1"))
+_hot.set_entries(["2409:8a60::/32"])
+check("热更新放行：CIDR 命中", _hot.allows("2409:8a60:cc40:8ea4::1"))
+_hot.set_entries([], closed=True)
+check("热更新收回：再次全拒", not _hot.allows("2409:8a60:cc40:8ea4::1"))
+
+# 端到端：中继先以 closed 启动（空白名单）→ 探测 denied、数据包被拒 →
+# 运行中热更新白名单 → 同一个 peer 立即放行（不重启、不换端口）
+game2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+game2.bind(("127.0.0.1", 0))
+game2.settimeout(3.0)
+game2_port = game2.getsockname()[1]
+rule_hot = relay.ForwardRule(
+    "127.0.0.1:0", f"127.0.0.1:{game2_port}",
+    allow=relay.AddressAllowList([], closed=True),
+)
+_, hot_port = rule_hot.actual_listen_endpoint()
+relay_hot = relay.UdpRelay([rule_hot], idle_timeout=0, log=lambda _: None)
+_relay_thread_hot = threading.Thread(
+    target=relay_hot.run, kwargs={"max_seconds": 8}, daemon=True)
+_relay_thread_hot.start()
+client2 = None
+try:
+    time.sleep(0.4)
+    # 空白名单时探测应回 denied（包到了，被守门拒）
+    _probe_closed = relay.probe_endpoint("127.0.0.1", hot_port, timeout=2.0)
+    check("空白名单启动：探测返回 denied（守门而非拒收探测）",
+          _probe_closed["status"] == "denied", f"status={_probe_closed['status']}")
+    check("空白名单启动：allow 报告已关闭", rule_hot.allow.is_closed)
+
+    # 数据包同样被拒
+    client2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    client2.bind(("127.0.0.1", 0))
+    client2.settimeout(2.0)
+    client2.sendto(b"knock", ("127.0.0.1", hot_port))
+    got_game = None
+    try:
+        got_game, _ = game2.recvfrom(4096)
+    except socket.timeout:
+        pass
+    check("空白名单启动：数据包不进游戏", got_game is None)
+
+    # 运行中热更新：放行 client2 的地址，无需重启
+    allow_hot = rule_hot.allow
+    allow_hot.set_entries([f"{client2.getsockname()[0]}/32"])
+    check("热更新后 allow 转为过滤态", not allow_hot.is_closed and not allow_hot.is_open)
+    client2.sendto(b"hello", ("127.0.0.1", hot_port))
+    got2, from2 = game2.recvfrom(4096)
+    check("热更新放行：同一端口立即接受新白名单", got2 == b"hello",
+          f"got={got2!r}")
+    check("热更新放行：回环地址池照常工作",
+          from2[0].startswith("127.0.0.") and from2[0] != "127.0.0.1",
+          f"来源 {from2[0]}")
+    # 下行也通（peer 建立后双向转发）
+    game2.sendto(b"welcome", from2)
+    back2, _ = client2.recvfrom(4096)
+    check("热更新放行：下行回包正常", back2 == b"welcome")
+
+    # 运行中热更新：重新关闭 → 新包再被拒
+    allow_hot.set_closed()
+    check("运行中收回白名单：is_closed", allow_hot.is_closed)
+    client2.sendto(b"bye", ("127.0.0.1", hot_port))
+    got3 = None
+    try:
+        got3, _ = game2.recvfrom(4096)
+    except socket.timeout:
+        pass
+    check("运行中收回白名单：数据包再次被拒", got3 is None)
+except socket.timeout as exc:
+    check("空白名单启动 + 热更新端到端", False, f"超时：{exc}")
+except OSError as exc:
+    check("空白名单启动 + 热更新端到端", False, f"{type(exc).__name__}: {exc}")
+finally:
+    relay_hot.stop()
+    game2.close()
+    if client2 is not None:
+        client2.close()
+
+
+# ==========================================================================
 print("\n== 13. 专用服务器（存档 / 模组扫描）==")
 from dst_ip_join import server  # noqa: E402
 
@@ -729,6 +852,231 @@ check("Settings 字段往返", _round.game_dir == "C:\\x" and _round.extra_args 
 
 
 # ==========================================================================
+print("\n== 14b. 服务器控制台（stdin 指令 / console_enabled 补写）==")
+_tmpdir = tempfile.mkdtemp(prefix="dst_selftest_console_")
+_troot = Path(_tmpdir)
+_cc = _troot / "DoNotStarveTogether" / "1000" / "Cluster_T"
+_cc.mkdir(parents=True)
+(_cc / "cluster.ini").write_text(
+    "[GAMEPLAY]\ngame_mode = survival\n\n[SHARD]\nshard_enabled = true\n",
+    encoding="utf-8")
+(_cc / "Master").mkdir()
+(_cc / "Master" / "server.ini").write_text(
+    "[SERVER]\nport = 10999\nis_master = true\n", encoding="utf-8")
+_tc = server.scan_cluster(_cc)
+check("控制台：默认 console_enabled=False", server.console_enabled(_tc) is False)
+_ok, _msg = server.enable_console(_tc)
+_text = (_cc / "cluster.ini").read_text(encoding="utf-8")
+check("控制台：enable_console 补写成功", _ok and server.console_enabled(_tc) is True, _msg)
+check("控制台：原有段保留",
+      "[GAMEPLAY]" in _text and "[SHARD]" in _text and "game_mode = survival" in _text)
+check("控制台：备份生成", (_cc / "cluster.ini.bak").is_file())
+_mtime = (_cc / "cluster.ini").stat().st_mtime_ns
+_ok2, _msg2 = server.enable_console(_tc)
+check("控制台：幂等且不动文件",
+      _ok2 and "已开启" in _msg2
+      and (_cc / "cluster.ini").stat().st_mtime_ns == _mtime)
+# [MISC] 段存在但为 false → 改写
+(_cc / "cluster.ini").write_text("[MISC]\nconsole_enabled = false\n", encoding="utf-8")
+_ok3, _ = server.enable_console(_tc)
+_text = (_cc / "cluster.ini").read_text(encoding="utf-8")
+check("控制台：false 改写为 true 且不重复",
+      _ok3 and _text.count("console_enabled") == 1
+      and server.console_enabled(_tc) is True, repr(_text))
+
+
+# —— stdin 指令管道（用桩对象，不起真实 DST） ——
+class _FakeStdin:
+    def __init__(self):
+        self.written = []
+
+    def write(self, s):
+        self.written.append(s)
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+class _FakeProc:
+    def __init__(self):
+        self.stdin = _FakeStdin()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=10):
+        return 0
+
+
+class _StubShard:
+    def __init__(self, name, is_master, port=10999):
+        self.name, self.is_master, self.port = name, is_master, port
+
+
+class _StubShardProc:
+    """只保留 ShardProcess 与 stdin 相关的接口。"""
+
+    def __init__(self, name, is_master, port=10999):
+        self.shard = _StubShard(name, is_master, port)
+        self.proc = _FakeProc()
+        self._stdin_lock = threading.Lock()
+
+    @property
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    send_command = server.ShardProcess.send_command
+    stop = server.ShardProcess.stop
+
+
+_pm, _pc = _StubShardProc("Master", True), _StubShardProc("Caves", False, 10998)
+_ok, _msg = _pm.send_command("c_listallplayers()")
+check("控制台：指令写入 stdin（带换行）",
+      _ok and _pm.proc.stdin.written == ["c_listallplayers()\n"], repr(_pm.proc.stdin.written))
+_ok, _msg = _pm.send_command("   ")
+check("控制台：空白指令拒绝", _ok is False, _msg)
+_pm.proc.returncode = 0
+_ok, _msg = _pm.send_command("c_save()")
+check("控制台：进程退出后拒绝", _ok is False and "未在运行" in _msg, _msg)
+
+# ServerManager.send_command：默认主世界 / 指定分片 / 未知分片
+_mgr = server.ServerManager.__new__(server.ServerManager)
+_mgr.cluster, _mgr.offline, _mgr.procs = None, False, [_pm, _pc]
+_pm.proc.returncode = None
+_ok, _msg = _mgr.send_command("c_save()")
+check("控制台：Manager 默认发主世界",
+      _ok and _pm.proc.stdin.written[-1] == "c_save()\n", _msg)
+_ok, _msg = _mgr.send_command("c_rollback(1)", shard="Caves")
+check("控制台：Manager 指定发洞穴",
+      _ok and _pc.proc.stdin.written[-1] == "c_rollback(1)\n", _msg)
+_ok, _msg = _mgr.send_command("x", shard="Nope")
+check("控制台：未知分片报错", _ok is False and "Nope" in _msg, _msg)
+
+# 接管句柄：一律拒绝并说明
+_ok, _msg = server.AttachedServer(None, []).send_command("c_save()")
+check("控制台：接管进程拒绝指令", _ok is False and "stdin" in _msg, _msg)
+
+# —— 暂停/继续（TheSim:SetTimeScale + 打点回显解析） ——
+# 打点模板必须是合法 Lua 单条语句（老坑：多语句挤一行会语法错误不执行）
+check("暂停：打点模板是单条 print",
+      server.SIM_TIMESCALE_PROBE_TEMPLATE.startswith('print("')
+      and server.SIM_TIMESCALE_PROBE_TEMPLATE.endswith(")")
+      and "\n" not in server.SIM_TIMESCALE_PROBE_TEMPLATE,
+      server.SIM_TIMESCALE_PROBE_TEMPLATE)
+check("暂停：暂停/继续命令是 TheSim:SetTimeScale（TheNet:SetServerPaused 在专用"
+      "服务器上不停模拟）",
+      server.PAUSE_ON_CMD == "TheSim:SetTimeScale(0)"
+      and server.PAUSE_OFF_CMD == "TheSim:SetTimeScale(1)"
+      and "TheSim:GetTimeScale()" in server.PAUSE_TOGGLE_CMD
+      and "\n" not in server.PAUSE_TOGGLE_CMD,
+      f"{server.PAUSE_ON_CMD!r} {server.PAUSE_OFF_CMD!r} {server.PAUSE_TOGGLE_CMD!r}")
+# 回显样例（日志泵会加 [Master] 前缀）：打点 + 引擎原生 Sim paused/unpaused
+_probe = ("[Master] [00:07:12]: DSTIPJ_SIM_TS=1\n"
+          "[Master] [00:08:01]: DSTIPJ_SIM_TS=0\n"
+          "[Master] [00:09:00]: Sim paused\n"
+          "[Master] [00:09:10]: Sim unpaused\n")
+check("暂停：解析打点/引擎行，取最后一条（unpaused=False）",
+      server.parse_pause_state(_probe) is False)
+check("暂停：打点 0=已暂停",
+      server.parse_pause_state("[Master] [00:03:03]: DSTIPJ_SIM_TS=0") is True)
+check("暂停：引擎行 Sim paused=True（pause_when_empty 自动暂停同源）",
+      server.parse_pause_state("[00:00:50]: Sim paused") is True)
+check("暂停：无线索返回 None",
+      server.parse_pause_state("[OK] 启动") is None
+      and server.parse_pause_state("") is None)
+check("暂停：无效打点数值忽略", server.parse_pause_state(
+    "DSTIPJ_SIM_TS=abc") is None)
+# 引擎时间戳（回显基线，替代会因块数上限缩水的文本长度基线）
+check("时间戳：解析引擎行 [HH:MM:SS]",
+      server.engine_timestamp("[Master] [00:03:45]: [1] (KU_x) 名 <wilson>") == 225
+      and server.engine_timestamp("[00:01:00]: Sim paused") == 60)
+check("时间戳：无时间戳行返回 None",
+      server.engine_timestamp("[OK] 已停止") is None
+      and server.engine_timestamp("普通文本") is None)
+
+# —— GUI 回归（2026-09-23 用户实测两 bug） ——
+# ① 点「暂停世界」必须发目标动作 SetTimeScale(0)：首版按当前状态发，
+#    未暂停时点了发 (1) = 保持现状，怎么点都没效果。
+# ② 刷新列表基线必须是引擎时间戳：首版只改了消费端，记录端还在记字符数
+#    （几万）＞时间戳（几百秒），回显全被当历史行丢弃。
+_qtw = globals().get("_qt_win")
+if _qtw is not None:  # PyQt6 缺失时 11b 节没建窗口，跳过
+    _gp = _StubShardProc("Master", True)
+    _gp.is_ready = lambda: True  # status() 会读；真类有，桩补一个
+    _gp.exit_code = None         # status() 也会读
+    _gm = server.ServerManager.__new__(server.ServerManager)
+    _gm.cluster, _gm.offline, _gm.procs = None, False, [_gp]
+    _qtw._server_manager = _gm
+    _qtw._refresh_console_row()
+    _qtw._server_paused = False  # 服务器运行中（时间刻度 1）
+    _qtw.run_quick_command("pause")
+    check("暂停：未暂停时点按发 SetTimeScale(0)（目标动作）",
+          _gp.proc.stdin.written[-1].startswith("TheSim:SetTimeScale(0)"),
+          repr(_gp.proc.stdin.written[-1]))
+    check("暂停：点按附带时间刻度打点（自证生效）",
+          "DSTIPJ_SIM_TS=" in _gp.proc.stdin.written[-1])
+    _qtw._server_paused = True
+    _qtw.run_quick_command("pause")
+    check("暂停：已暂停时点按发 SetTimeScale(1)（恢复）",
+          _gp.proc.stdin.written[-1].startswith("TheSim:SetTimeScale(1)"),
+          repr(_gp.proc.stdin.written[-1]))
+    _qtw._server_manager = None
+    _qtw._refresh_console_row()
+    _qtw.server_log_view.clear()
+    _qtw.refresh_players()
+    check("玩家：刷新基线是引擎时间戳或 None（绝不能是字符数）",
+          _qtw._player_capture_after is None
+          or _qtw._player_capture_after < 86400,
+          str(_qtw._player_capture_after))
+
+
+# ==========================================================================
+print("\n== 14c. 玩家管理（在线列表解析 / 踢 / 拉黑）==")
+_lines = (
+    "[1] (KU_abCd1234) 张三 <wilson>\n"
+    "[2] (KU_xyZw5678) 带空格 名字 <wolfgang>\n"
+    "[Master] [3] (KU_缩进的) 缩进 <wx78>\n"
+    # 2026-09-23 用户真实服务器的行：时间戳前缀 + OU_ 前缀 ID + 行尾制表符
+    "[Master] [00:07:09]: [1] (OU_76561199032098747) SLDYK <wortox>\t\n"
+    "不是玩家行\n"
+)
+_players = server.parse_player_lines(_lines)
+check("玩家：解析出 4 个（容忍分片/时间戳前缀）", len(_players) == 4, str(len(_players)))
+check("玩家：字段正确",
+      _players[0]["userid"] == "KU_abCd1234" and _players[0]["prefab"] == "wilson"
+      and _players[1]["name"] == "带空格 名字", str(_players[:2]))
+_real = next(p for p in _players if p["userid"].startswith("OU_"))
+check("玩家：OU_ 前缀与时间戳前缀可解析",
+      _real == {"index": 1, "userid": "OU_76561199032098747",
+                "name": "SLDYK", "prefab": "wortox"}, str(_real))
+check("玩家：空文本/无玩家行返回空",
+      server.parse_player_lines("") == []
+      and server.parse_player_lines("[OK] 启动") == [])
+
+_broot = Path(tempfile.mkdtemp(prefix="dst_selftest_ban_"))
+_bc = server.ClusterInfo(name="Cluster_B", path=_broot, ownerdir=Path("1000"))
+_ok, _msg = server.add_blocklist_userid(_bc, "KU_abCd1234")
+check("拉黑：首次写入成功", _ok and "KU_abCd1234" in _msg, _msg)
+_ok2, _msg2 = server.add_blocklist_userid(_bc, "KU_abCd1234")
+check("拉黑：重复写入幂等", _ok2 and "已在黑名单" in _msg2, _msg2)
+check("拉黑：文件仍一行", (_broot / "blocklist.txt").read_text().count("KU_") == 1)
+_ok3, _msg3 = server.add_blocklist_userid(_bc, "KU_中文用户")
+check("拉黑：中文 Klei ID 可写", _ok3 and "KU_中文用户" in
+      (_broot / "blocklist.txt").read_text(encoding="utf-8"))
+_ok4, _msg4 = server.add_blocklist_userid(_bc, "not-an-id")
+check("拉黑：非法 ID 拒绝", _ok4 is False and "不像合法" in _msg4, _msg4)
+shutil.rmtree(_broot, ignore_errors=True)
+
+
+# ==========================================================================
 print("\n== 15. 接管：进程发现与监控 ==")
 
 # 命令行参数解析
@@ -746,29 +1094,35 @@ check("APP:Klei/ 解析到 <文档>\\Klei",
 check("绝对路径原样返回",
       server._resolve_storage_root("D:\\saves") == Path("D:\\saves"))
 
-# 构造两个假分片进程（同一集群）+ 一个别的集群，验证分组取进程数最多的
+# 构造两个假分片进程（同一集群）+ 一个别的集群，验证分组取进程数最多的。
+# 集群名动态取**真实存在**的第一个（曾经硬编码 Cluster_2，磁盘上没有该存档后
+# 「匹配真实存档」一项就永久失败 —— 测试数据要跟着机器现状走）。
+_all_clusters = server.scan_clusters(
+    workshop_content=server.workshop_content_dir(_ugc_dir) if _found else None,
+    game_dir=_game_dir if _found else None)
+_cluster_name = _all_clusters[0].name if _all_clusters else "Cluster_X"
 _p1 = server.ShardProcInfo(pid=999001, name="dontstarve_dedicated_server_nullrenderer_x64.exe",
-                           cmdline=_cl, cluster_name="Cluster_2", shard_name="Master",
+                           cmdline=_cl.replace("Cluster_2", _cluster_name),
+                           cluster_name=_cluster_name, shard_name="Master",
                            ownerdir="1071833019", is_master=True)
 _cl2 = _cl.replace("Master", "Caves").replace("DST_Master", "DST_Secondary")
 _p2 = server.ShardProcInfo(pid=999002, name="dontstarve_dedicated_server_nullrenderer_x64.exe",
-                           cmdline=_cl2, cluster_name="Cluster_2", shard_name="Caves",
+                           cmdline=_cl2.replace("Cluster_2", _cluster_name),
+                           cluster_name=_cluster_name, shard_name="Caves",
                            ownerdir="1071833019", is_master=False)
 _p3 = server.ShardProcInfo(pid=999003, name="dontstarve_dedicated_server_nullrenderer_x64.exe",
                            cmdline=_cl.replace("Cluster_2", "Other"),
                            cluster_name="Other", shard_name="Master", ownerdir="1071833019")
 
-# 真实存档用于匹配
-_real = server.scan_clusters(
-    workshop_content=server.workshop_content_dir(_ugc_dir) if _found else None,
-    game_dir=_game_dir if _found else None)
+# 真实存档用于匹配（复用上面已扫的列表）
+_real = _all_clusters
 _att = server.attach_running_procs(_real, procs=[_p1, _p2, _p3])
 check("接管返回非空", _att is not None)
-check("按进程数最多分组（选中 Cluster_2 的 2 个分片）",
+check("按进程数最多分组（选中同一集群的 2 个分片）",
       _att is not None and len(_att.shards) == 2)
 if _att is not None:
     check("接管对象匹配到真实存档", _att.cluster is not None
-          and _att.cluster.name == "Cluster_2")
+          and _att.cluster.name == _cluster_name)
     check("识别主分片", any(s.is_master for s in _att.shards))
     check("标记为接管（attached）", _att.attached is True)
     _st = _att.status()

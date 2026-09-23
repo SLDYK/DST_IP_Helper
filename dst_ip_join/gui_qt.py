@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import re
 import traceback
+from typing import ClassVar
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -31,6 +33,8 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QPlainTextEdit,
@@ -198,6 +202,9 @@ LEVEL_STYLE = {
 }
 LOG_COLORS = {"OK": "#1a7f37", "WARN": "#9a6700", "FAIL": "#cf222e", "INFO": "#57606a"}
 LEVEL_LINE_RE = re.compile(r"^\[(OK|WARN|FAIL|INFO)\s*\]")
+
+# 玩家行解析在 server.parse_player_lines（纯标准库，GUI/selftest/CLI 共用），这里只是引用
+from .server import parse_player_lines  # noqa: E402
 
 
 def _is_offscreen() -> bool:
@@ -401,6 +408,15 @@ class PublicAddressThread(QThread):
 # 主窗口
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    # 一键执行的常用指令。(key, 按钮文字, 提示)。回档有破坏性，执行前会先确认。
+    QUICK_COMMANDS: ClassVar[list[tuple[str, str, str]]] = [
+        ("save", "存档", "立即保存世界（c_save()）。随时可点，不影响玩家"),
+        ("rollback", "回档一天", "回滚到上一个存档点（c_rollback(1)）。"
+         "上一日的进度会丢失，玩家会被踢回主菜单/重进"),
+        ("pause", "暂停世界", "暂停/继续服务器模拟（TheNet:SetServerPaused）。"
+         "暂停时世界时间停止，已连接玩家保持在线但动不了"),
+    ]
+
     def __init__(self, auto_run: bool = False, auto_scan: bool | None = None) -> None:
         """``auto_run=True`` 才会在窗口出现后自动跑网络检测（默认不跑）。
 
@@ -433,6 +449,14 @@ class MainWindow(QMainWindow):
         self._addr_probe_ip = ""
         self._addr_probe_note = ""
         self._public_addr_thread: PublicAddressThread | None = None
+        # 开服页控制台：当前存档是否已开 console_enabled
+        self._console_ready = False
+        # 玩家管理：等待 c_listallplayers() 回显时记录日志长度基线（None=不在刷新中）
+        self._player_capture_after: int | None = None
+        # 服务器暂停状态（None=未知，按钮显示中性「暂停/继续」）
+        self._server_paused: bool | None = None
+        # 等暂停回显时的引擎时间戳基线（None=不在等待中；见 _chunk_fresh）
+        self._pause_capture_at: int | None = None
 
         self.setWindowTitle(f"{config.APP_NAME}  v{config.APP_VERSION}")
         self.resize(900, 640)
@@ -490,6 +514,23 @@ class MainWindow(QMainWindow):
         self.admin_badge.setProperty("admin", "0")
         self.admin_badge.setVisible(False)
         row.addWidget(self.admin_badge)
+        # 徽标原先只在检测完成回调里显示；2026-09-23 起启动不再自动检测，
+        # 徽标会一直藏着 → 改成搭界面时就显示。is_admin 是纯本地轻量调用
+        # （IsUserAnAdmin，不联网不改系统），不需要等检测结果。
+        self._refresh_admin_badge(winproc.is_admin())
+
+    def _refresh_admin_badge(self, is_admin: bool) -> None:
+        """按权限设置右上角徽标文案与配色并显示。"""
+        if is_admin:
+            self.admin_badge.setText("● 管理员模式")
+            self.admin_badge.setProperty("admin", "1")
+        else:
+            self.admin_badge.setText("● 普通权限")
+            self.admin_badge.setProperty("admin", "0")
+        # 触发样式刷新
+        self.admin_badge.style().unpolish(self.admin_badge)
+        self.admin_badge.style().polish(self.admin_badge)
+        self.admin_badge.setVisible(True)
 
     def _card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
         card = QFrame(objectName="card")
@@ -759,7 +800,10 @@ class MainWindow(QMainWindow):
 
         btnrow = QHBoxLayout()
         self.btn_join_apply = QPushButton("确认生效并启动中继", objectName="primary")
-        self.btn_join_apply.clicked.connect(self.apply_and_start)
+        self.btn_join_apply.setToolTip(
+            "未启动：绑定端口、放行防火墙并启动中继（没有加入码也能启动，"
+            "先以「拒绝所有人」守门）；\n已启动：只把当前加入码热更新进去，立即生效、不重启")
+        self.btn_join_apply.clicked.connect(self.apply_host_rules)
         btnrow.addWidget(self.btn_join_apply)
         self.btn_host_stop = QPushButton("停止")
         self.btn_host_stop.clicked.connect(self.stop_relay)
@@ -995,7 +1039,104 @@ class MainWindow(QMainWindow):
         self.server_shards_label = QLabel("", objectName="checkDetail")
         self.server_shards_label.setWordWrap(True)
         alay.addWidget(self.server_shards_label)
+
+        # 服务器控制台：直接向专用服务器进程的 stdin 发 Lua 指令
+        crow = QHBoxLayout()
+        crow.setSpacing(6)
+        self.server_cmd_input = QLineEdit(objectName="portInput")
+        self.server_cmd_input.setPlaceholderText(
+            "服务器控制台：输入 Lua 指令回车执行，如 c_listallplayers()")
+        self.server_cmd_input.returnPressed.connect(self.send_server_command)
+        crow.addWidget(self.server_cmd_input, stretch=1)
+        self.server_cmd_target = QComboBox()
+        self.server_cmd_target.setToolTip("指令发给哪个分片（洞穴是独立进程）")
+        crow.addWidget(self.server_cmd_target)
+        self.btn_server_cmd_send = QPushButton("执行")
+        self.btn_server_cmd_send.setToolTip(
+            "把指令写进服务器进程 stdin。需要本工具启动的服务器；"
+            "接管的外部进程拿不到 stdin")
+        self.btn_server_cmd_send.clicked.connect(self.send_server_command)
+        self.btn_server_cmd_send.setEnabled(False)
+        crow.addWidget(self.btn_server_cmd_send)
+        self.btn_console_fix = QPushButton("开启控制台")
+        self.btn_console_fix.setToolTip(
+            "向该存档的 cluster.ini 写入 [MISC] console_enabled = true\n"
+            "（自动备份为 cluster.ini.bak）。不开启时服务器可能不受理 stdin 指令")
+        self.btn_console_fix.clicked.connect(self._on_fix_console)
+        self.btn_console_fix.setVisible(False)
+        crow.addWidget(self.btn_console_fix)
+        alay.addLayout(crow)
+
+        # 常用指令一键执行（回档有破坏性，会先确认；看玩家在下面的玩家管理卡里）
+        qrow = QHBoxLayout()
+        qrow.setSpacing(6)
+        self.quick_cmd_buttons: dict[str, QPushButton] = {}
+        for key, label, tip in self.QUICK_COMMANDS:
+            btn = QPushButton(label)
+            btn.setToolTip(tip)
+            btn.clicked.connect(lambda _c=False, k=key: self.run_quick_command(k))
+            btn.setEnabled(False)
+            qrow.addWidget(btn)
+            self.quick_cmd_buttons[key] = btn
+        qrow.addStretch(1)
+        alay.addLayout(qrow)
         left.addWidget(acard)
+        self._refresh_console_row()  # 初始「未运行」态：禁用输入框并给出引导占位
+
+        # 玩家管理：在线列表 + 踢/拉黑（解析「看玩家」的输出行）
+        pcard, play = self._card("玩家管理")
+        prow = QHBoxLayout()
+        prow.setSpacing(6)
+        self.btn_player_refresh = QPushButton("刷新列表")
+        self.btn_player_refresh.setToolTip(
+            "向服务器发 c_listallplayers() 并解析日志得到在线玩家")
+        self.btn_player_refresh.clicked.connect(self.refresh_players)
+        self.btn_player_refresh.setEnabled(False)
+        prow.addWidget(self.btn_player_refresh)
+        self.player_autorefresh = QCheckBox("自动 5s")
+        self.player_autorefresh.setToolTip("每 5 秒自动刷新在线玩家列表")
+        self.player_autorefresh.toggled.connect(self._on_player_autorefresh_toggled)
+        self.player_autorefresh.setEnabled(False)
+        prow.addWidget(self.player_autorefresh)
+        self.btn_player_kick = QPushButton("踢出", objectName="danger")
+        self.btn_player_kick.setToolTip("把选中玩家踢下线（TheNet:Kick），不拉黑")
+        self.btn_player_kick.clicked.connect(lambda: self.player_kick_ban(kick=True))
+        self.btn_player_kick.setEnabled(False)
+        prow.addWidget(self.btn_player_kick)
+        self.btn_player_ban = QPushButton("拉黑", objectName="danger")
+        self.btn_player_ban.setToolTip(
+            "把选中玩家写进存档的 blocklist.txt 并踢下线（重启后仍生效）")
+        self.btn_player_ban.clicked.connect(lambda: self.player_kick_ban(kick=False))
+        self.btn_player_ban.setEnabled(False)
+        prow.addWidget(self.btn_player_ban)
+        prow.addStretch(1)
+        play.addLayout(prow)
+
+        self.player_table = QTableWidget(0, 3)
+        self.player_table.setHorizontalHeaderLabels(["玩家", "角色", "Klei ID"])
+        self.player_table.verticalHeader().setVisible(False)
+        self.player_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.player_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.player_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self.player_table.itemSelectionChanged.connect(self._on_player_selection_changed)
+        self.player_table.setMinimumHeight(110)
+        self.player_table.setMaximumHeight(170)
+        header = self.player_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        play.addWidget(self.player_table)
+        self.player_hint_label = QLabel(
+            "服务器未运行时不可用；启动后点「刷新列表」或勾选自动刷新。",
+            objectName="checkDetail")
+        self.player_hint_label.setWordWrap(True)
+        play.addWidget(self.player_hint_label)
+        left.addWidget(pcard)
+
+        # 自动刷新定时器（默认 5s；服务器启动并勾选后才转）
+        self._player_timer = QTimer(self)
+        self._player_timer.setInterval(5000)
+        self._player_timer.timeout.connect(self._player_timer_tick)
 
         # 第 3 步：明文显示的加入指令（直接发给朋友）
         jcard, jlay = self._card("第 3 步 · 把加入指令发给朋友")
@@ -1109,8 +1250,12 @@ class MainWindow(QMainWindow):
         self.btn_server_stop.setEnabled(True)
         self.server_status_label.setText("已接管运行中的服务器（监控中）")
         self._append_server_log("[OK] 已接管运行中的服务器")
+        self._server_paused = None  # 外部进程，状态未知且无法主动查询
+        self._pause_capture_at = None
         self._server_timer.start()
         self._pump_server_logs()
+        self._refresh_console_row()
+        self._on_player_autorefresh_manage()
         self._refresh_server_join_command()
 
     def _on_cluster_changed(self, _index: int) -> None:
@@ -1144,7 +1289,28 @@ class MainWindow(QMainWindow):
             self.server_status_label.setText("⚠ 有模组未下载，可用启动前更新模组补齐")
         else:
             self.server_status_label.setText("就绪，可以启动")
+        # 控制台需要 cluster.ini 的 [MISC] console_enabled=true（缺则给一键补写按钮）
+        console_ok = server.console_enabled(cluster)
+        self._console_ready = console_ok
+        self.btn_console_fix.setVisible(not console_ok)
         self._refresh_server_join_command()
+
+    def _on_fix_console(self) -> None:
+        """给当前存档补写 [MISC] console_enabled = true。"""
+        cluster = self._current_cluster()
+        if cluster is None:
+            return
+        ok, msg = server.enable_console(cluster)
+        self._append_server_log(("[OK] " if ok else "[FAIL] ") +
+                                f"{cluster.name}: {msg}")
+        if ok:
+            self.btn_console_fix.setVisible(False)
+            self._console_ready = True
+            self._notify("info",
+                         f"已开启服务器控制台（{msg}）。\n"
+                         "对已运行的服务器不生效，需下次启动。")
+        else:
+            self._notify("warn", msg)
 
     def _current_cluster(self):
         data = self.cluster_combo.currentData()
@@ -1348,6 +1514,11 @@ class MainWindow(QMainWindow):
         self._server_manager = manager
         self.server_status_label.setText("运行中")
         self._append_server_log("[OK] 全部分片已就绪")
+        self._server_paused = None  # 新的一次运行，暂停状态未知
+        self._pause_capture_at = None
+        self._player_capture_after = None  # 引擎时钟归零，旧时间戳基线作废
+        self._refresh_console_row()
+        self._on_player_autorefresh_manage()
         self._refresh_server_join_command()
 
     def _on_server_failed(self, tb: str) -> None:
@@ -1361,6 +1532,7 @@ class MainWindow(QMainWindow):
         if self._server_manager is None or not self._server_manager.any_running():
             self.btn_server_start.setEnabled(True)
             self.btn_server_stop.setEnabled(False)
+        self._refresh_console_row()
 
     def stop_server(self) -> None:
         if self._server_manager is None:
@@ -1372,12 +1544,314 @@ class MainWindow(QMainWindow):
         self._server_manager = None
         self._attached_pending = None
         self._server_timer.stop()
+        self._server_paused = None  # 新的一次运行，暂停状态未知
+        self._pause_capture_at = None
+        pause_btn = self.quick_cmd_buttons.get("pause")
+        if pause_btn is not None:
+            pause_btn.setText("暂停世界")
         self.server_status_label.setText("已停止")
         self.btn_server_start.setEnabled(True)
         self.btn_server_attach.setEnabled(False)
         self.btn_server_stop.setEnabled(False)
         self._append_server_log("[OK] 已停止")
+        self._refresh_console_row()
+        self._on_player_autorefresh_manage()
         self._refresh_server_join_command()
+
+    # -- 开服：服务器控制台 -----------------------------------------------------
+
+    def _refresh_console_row(self) -> None:
+        """按当前 manager 形态更新控制台行（分片下拉 + 执行按钮）。
+
+        - 本工具启动的：分片下拉列出全部运行中的分片，按钮可用；
+        - 接管的外部进程：stdin 不在手里，按钮禁用并说明原因；
+        - 没有服务器：占位提示。
+        """
+        manager = self._server_manager
+        self.server_cmd_target.blockSignals(True)
+        self.server_cmd_target.clear()
+        console_ready = False
+        if manager is None:
+            self.server_cmd_target.addItem("未运行", "")
+            self.server_cmd_input.setPlaceholderText(
+                "服务器控制台：启动服务器后可在此输入 Lua 指令，如 c_listallplayers()")
+        elif getattr(manager, "attached", False):
+            self.server_cmd_target.addItem("外部进程", "")
+            self.server_cmd_input.setPlaceholderText(
+                "接管的外部服务器无法接收指令（stdin 不在本工具手里）")
+        else:
+            for s in manager.status():
+                if s["running"]:
+                    mark = "★ " if s["is_master"] else ""
+                    self.server_cmd_target.addItem(f"{mark}{s['shard']}", s["shard"])
+            console_ready = self.server_cmd_target.count() > 0
+            if not console_ready:
+                self.server_cmd_target.addItem("未运行", "")
+            self.server_cmd_input.setPlaceholderText(
+                "服务器控制台：输入 Lua 指令回车执行，如 c_listallplayers()")
+        self.server_cmd_target.blockSignals(False)
+        self.btn_server_cmd_send.setEnabled(console_ready)
+        self.server_cmd_input.setEnabled(console_ready)
+        for btn in self.quick_cmd_buttons.values():
+            btn.setEnabled(console_ready)
+
+    def _send_console_command(self, command: str, *, note: str = "") -> bool:
+        """把一条 Lua 指令写进所选分片的 stdin。返回是否成功。"""
+        manager = self._server_manager
+        if manager is None:
+            self._append_server_log("[WARN] 服务器未运行，没有可接收指令的进程")
+            return False
+        command = command.strip()
+        if not command:
+            self._append_server_log("[WARN] 指令为空")
+            return False
+        ok, msg = manager.send_command(command, self.server_cmd_target.currentData() or "")
+        self._append_server_log(("[OK] " if ok else "[WARN] ") + msg)
+        if ok:
+            self._append_server_log(
+                "[INFO] 指令已送入 stdin；服务器不回显输入，"
+                + (f"{note}，" if note else "") + "稍候在下面日志里看执行结果")
+        return ok
+
+    def send_server_command(self) -> None:
+        """把输入框里的 Lua 指令写进所选分片的 stdin。"""
+        command = self.server_cmd_input.text().strip()
+        if not command:
+            self._append_server_log("[WARN] 指令为空")
+            return
+        if self._send_console_command(command):
+            self.server_cmd_input.clear()
+
+    def run_quick_command(self, key: str) -> None:
+        """一键执行常用指令。破坏性的（回档）先弹确认。"""
+        entry = next((q for q in self.QUICK_COMMANDS if q[0] == key), None)
+        if entry is None:
+            return
+        _, label, _tip = entry
+
+        command = {
+            "save": "c_save()",
+            "rollback": "c_rollback(1)",
+            "pause": server.SIM_TIMESCALE_PROBE_TEMPLATE,
+        }[key]
+
+        if key == "pause":
+            # 🔴 专用服务器的暂停 = 时间刻度 0（TheNet:SetServerPaused 只切
+            # 客户端暂停菜单语义，世界照跑——2026-09-23 用户实测无效）。
+            # 点按发的是「目标动作」：当前没暂停 → 发 SetTimeScale(0) 去暂停；
+            # 已暂停 → 发 (1) 去恢复。（首版按当前状态发，正好发反，
+            # 点一下等于保持现状——用户实测两连点都发 (1) 无效果。）
+            # 未知 → 单表达式取反（两条语句挤一行会是 Lua 语法错误）。
+            # 每次都带打点：暂停时 stdin 控制台仍处理指令，回显能自证生效。
+            paused = self._server_paused
+            toggle = (server.PAUSE_TOGGLE_CMD
+                      if paused is None else
+                      (server.PAUSE_OFF_CMD if paused else server.PAUSE_ON_CMD))
+            self._send_console_command(f"{toggle} {server.SIM_TIMESCALE_PROBE_TEMPLATE}")
+            self._pause_capture_at = self._last_engine_ts()
+            self._append_server_log(
+                "[INFO] 已发送暂停/继续指令（TheSim:SetTimeScale），"
+                "等服务器回显当前时间刻度…")
+            return
+        # 破坏性操作先确认；离屏（自动化测试）不能弹模态框，直接放行
+        if key == "rollback" and not _is_offscreen():
+            answer = QMessageBox.question(
+                self,
+                config.APP_NAME,
+                f"确定要「{label}」吗？\n\n"
+                "回滚到上一个存档点（丢失最近进度，玩家会被断开）。\n\n"
+                f"将对分片「{self.server_cmd_target.currentText()}」执行 {command}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._append_server_log(f"[INFO] 已取消：{label}")
+                return
+
+        self._send_console_command(command)
+
+    # -- 开服：玩家管理（在线列表 / 踢 / 拉黑） -----------------------------------
+
+    def refresh_players(self) -> None:
+        """刷新在线玩家：发 c_listallplayers()，让日志泵解析回显。"""
+        if self._server_manager is None:
+            self._append_server_log("[WARN] 服务器未运行，先启动再刷新玩家列表")
+            return
+        # 记下发指令时的基线：只认**这之后**的回显。
+        # 🔴 基线必须是引擎时间戳（_chunk_fresh 按秒比较），不能是日志字符数
+        # ——首版只改了消费端、这里还记长度（几万）＞时间戳（几百秒），
+        # 所有回显被判成历史行，列表永远不更新（2026-09-23 用户实测）。
+        self._player_capture_after = self._last_engine_ts()
+        self._send_console_command("c_listallplayers()")
+
+    def _last_engine_ts(self) -> int | None:
+        """日志视图里最后一条引擎时间戳（发指令时刻的基线）。"""
+        ts = None
+        for line in self.server_log_view.toPlainText().splitlines():
+            value = server.engine_timestamp(line)
+            if value is not None:
+                ts = value
+        return ts
+
+    def _chunk_fresh(self, chunk: str, baseline: int | None) -> bool:
+        """这批日志增量是否发生在基线之后。
+
+        🔴 不能用日志文本长度当基线：日志视图有 ``setMaximumBlockCount``，
+        长会话下旧块被驱逐、``toPlainText()`` 长度不增反缩，「新回显」会被
+        误判成历史行而丢弃（2026-09-23 用户实测玩家列表/暂停回显全部失灵
+        的根因）。引擎行自带 ``[HH:MM:SS]`` 时间戳，用它判断先后。
+        """
+        if baseline is None:
+            return True
+        for line in chunk.splitlines():
+            ts = server.engine_timestamp(line)
+            if ts is not None and ts >= baseline:
+                return True
+        return False
+
+    def _maybe_capture_players(self, chunk: str) -> None:
+        """日志泵增量里出现玩家行时填表（只认发出刷新指令之后新增的日志）。"""
+        if self._player_capture_after is None:
+            return
+        players = parse_player_lines(chunk)
+        if not players:
+            return
+        if not self._chunk_fresh(chunk, self._player_capture_after):
+            # 这批行是发出刷新指令**之前**就在日志里的（历史回显），不认。
+            return
+        self._player_capture_after = None
+        self._populate_player_table(players)
+
+    def _maybe_apply_pause_probe(self, chunk: str) -> None:
+        """日志泵增量里出现暂停线索时校准「暂停世界」按钮。
+
+        线索两种：打点回显 DSTIPJ_SIM_TS=（权威），引擎行 Sim paused/unpaused
+        （pause_when_empty 自动暂停也会打）。只认发出指令**之后**的新增日志
+        （引擎时间戳基线），解析出值才更新状态与文案。
+        """
+        value = server.parse_pause_state(chunk)
+        if value is None:
+            return
+        if not self._chunk_fresh(chunk, self._pause_capture_at):
+            return
+        self._pause_capture_at = None
+        self._server_paused = value
+        btn = self.quick_cmd_buttons.get("pause")
+        if btn is not None:
+            btn.setText("继续世界" if value else "暂停世界")
+        self._append_server_log(
+            "[OK] 服务器当前" + ("已暂停（点「继续世界」恢复）" if value else "运行中（未暂停）"))
+
+    def _populate_player_table(self, players: list[dict]) -> None:
+        self.player_table.setRowCount(0)
+        self.player_table.setRowCount(len(players))
+        for row, p in enumerate(players):
+            for col, key in enumerate(("name", "prefab", "userid")):
+                item = QTableWidgetItem(str(p[key]))
+                if key == "userid":
+                    item.setData(Qt.ItemDataRole.UserRole, p["userid"])
+                self.player_table.setItem(row, col, item)
+        self.player_table.resizeColumnsToContents()
+        self.player_hint_label.setText(f"在线 {len(players)} 人；选中后可踢出或拉黑。")
+        self._on_player_selection_changed()
+
+    def _selected_player(self) -> dict | None:
+        # 用 selectedItems 而不是 currentRow：QTableView 的 currentRow 与选中
+        # 状态是两套，删行后 currentRow 可能变 -1，导致明明选中了却取不到。
+        items = self.player_table.selectedItems()
+        if not items:
+            return None
+        row = items[0].row()
+
+        def col(c: int) -> str:
+            item = self.player_table.item(row, c)
+            return item.text() if item is not None else ""
+        return {"name": col(0), "prefab": col(1), "userid": col(2)}
+
+    def _on_player_selection_changed(self) -> None:
+        ok = self._selected_player() is not None
+        self.btn_player_kick.setEnabled(ok)
+        self.btn_player_ban.setEnabled(ok)
+
+    def _on_player_autorefresh_toggled(self, checked: bool) -> None:
+        if checked:
+            self.refresh_players()
+            self._player_timer.start()
+        else:
+            self._player_timer.stop()
+
+    def _player_timer_tick(self) -> None:
+        if self._server_manager is None or not self._server_manager.any_running():
+            self._player_timer.stop()
+            self.player_autorefresh.setChecked(False)
+            return
+        self.refresh_players()
+
+    def player_kick_ban(self, *, kick: bool) -> None:
+        """踢出（TheNet:Kick）或拉黑（写 blocklist.txt + 踢）选中玩家。"""
+        player = self._selected_player()
+        if player is None:
+            self._append_server_log("[WARN] 先在列表里选中一个玩家")
+            return
+        manager = self._server_manager
+        if manager is None:
+            self._append_server_log("[WARN] 服务器未运行")
+            return
+        userid, name = player["userid"], player["name"]
+        action = "踢出" if kick else "拉黑（写入 blocklist.txt）"
+
+        if not _is_offscreen():
+            answer = QMessageBox.question(
+                self, config.APP_NAME,
+                f"确定要{action}玩家 {name}（{userid}）吗？"
+                + ("" if kick else "\n\n拉黑后会写入存档的 blocklist.txt，重启服务器仍生效。"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._append_server_log(f"[INFO] 已取消{action} {name}")
+                return
+
+        if not kick:
+            cluster = self._current_cluster()
+            if cluster is None:
+                self._append_server_log("[WARN] 拉黑需要知道当前存档，但没有选中存档")
+                return
+            ok, msg = server.add_blocklist_userid(cluster, userid)
+            self._append_server_log(("[OK] " if ok else "[WARN] ") +
+                                    f"blocklist.txt: {msg}")
+
+        # ⚠️ 必须是**单条语句**。曾经写成「local u=... or ... TheNet:Kick(u)」，
+        # 两条语句挤一行没有分隔符 → Lua 语法错误 → 指令根本没执行，
+        # 玩家没被踢、下次刷新又回到列表里（stdin 写入成功不代表执行成功）。
+        command = f'TheNet:Kick(UserToClientID("{userid}") or "{userid}")'
+        ok, msg = manager.send_command(command, self.server_cmd_target.currentData() or "")
+        self._append_server_log(("[OK] " if ok else "[WARN] ") + msg)
+        if ok:
+            self._append_server_log(f"[INFO] 已{action} {name}；列表稍后自动刷新")
+            # 把人从表里移除，避免误以为还在线
+            sel = self.player_table.selectedItems()
+            if sel:
+                self.player_table.removeRow(sel[0].row())
+            self._on_player_selection_changed()
+
+    def _on_player_autorefresh_manage(self) -> None:
+        """服务器启停/接管时同步玩家管理行的可用状态。"""
+        manager = self._server_manager
+        ready = (manager is not None and manager.any_running()
+                 and not getattr(manager, "attached", False))
+        self.btn_player_refresh.setEnabled(ready)
+        self.player_autorefresh.setEnabled(ready)
+        if not ready:
+            self._player_timer.stop()
+            self.player_autorefresh.setChecked(False)
+            self.player_table.setRowCount(0)
+            self.btn_player_kick.setEnabled(False)
+            self.btn_player_ban.setEnabled(False)
+            self.player_hint_label.setText(
+                "接管的外部服务器拿不到 stdin，无法刷新在线列表；"
+                if manager is not None else
+                "服务器未运行时不可用；启动后点「刷新列表」或勾选自动刷新。")
 
     def _pump_server_logs(self) -> None:
         manager = getattr(self, "_server_manager", None)
@@ -1386,6 +1860,8 @@ class MainWindow(QMainWindow):
         chunk = manager.pump_logs()
         if chunk:
             self.server_log_view.appendPlainText(chunk)
+            self._maybe_capture_players(chunk)
+            self._maybe_apply_pause_probe(chunk)
         # 刷新分片状态行
         parts = []
         for s in manager.status():
@@ -1576,11 +2052,37 @@ class MainWindow(QMainWindow):
         self._session = relay.make_session_token()
         self._refresh_host_code()
         self._append_relay_log("[INFO] 已更换校验值，旧的加入码将作废")
+        self._sync_host_allow()
 
     def copy_host_code(self) -> None:
         self._copy_code(self.host_code_view.text(), "主机码")
 
     # ---- 加入码管理（主机端）----
+    def _sync_host_allow(self) -> None:
+        """把当前加入码状态热更新到运行中的中继（不用重启）。
+
+        四个入口共用：添加 / 启停勾选 / 删除加入码、更换校验值。
+        主机端的多条规则共用**同一个** ``AddressAllowList`` 实例，
+        整体替换一次即可同时作用于所有端口。
+        """
+        thread = self.relay_thread
+        if thread is None or not thread.isRunning() or thread.relay is None:
+            return
+        allow = (thread.relay.rules[0].allow if thread.relay.rules else None)
+        if allow is None:
+            return
+        entries = relay.allow_entries_from_codes(
+            relay.load_join_codes(), self._session
+        )
+        allow.set_entries(entries, closed=not entries)
+        if entries:
+            shown = "、".join(entries[:3]) + ("…" if len(entries) > 3 else "")
+            self._append_relay_log(
+                f"[OK  ] 白名单已更新（立即生效）：{len(entries)} 个地址（{shown}）")
+        else:
+            self._append_relay_log(
+                "[INFO] 白名单已清空：所有外部加入将被拒绝，添加加入码后立即放行")
+
     def _reload_join_list(self) -> None:
         while self.join_list_layout.count():
             item = self.join_list_layout.takeAt(0)
@@ -1589,7 +2091,7 @@ class MainWindow(QMainWindow):
                 widget.deleteLater()
         entries = relay.load_join_codes()
         if not entries:
-            hint = QLabel("（还没有加入码；把朋友发来的 JOIN… 粘贴到上面添加）",
+            hint = QLabel("（还没有加入码；可以先启动中继，添加后立即生效）",
                           objectName="checkDetail")
             hint.setWordWrap(True)
             self.join_list_layout.addWidget(hint)
@@ -1662,6 +2164,7 @@ class MainWindow(QMainWindow):
         )
         if warn:
             self._notify("warn", warn.strip())
+        self._sync_host_allow()
 
     def _toggle_join(self, index: int, enabled: bool) -> None:
         entries = relay.load_join_codes()
@@ -1669,6 +2172,7 @@ class MainWindow(QMainWindow):
             entries[index]["enabled"] = bool(enabled)
             relay.save_join_codes(entries)
             self._reload_join_list()
+            self._sync_host_allow()
 
     def _delete_join(self, index: int) -> None:
         entries = relay.load_join_codes()
@@ -1679,6 +2183,7 @@ class MainWindow(QMainWindow):
             self._append_relay_log(
                 f"[INFO] 已删除加入码：{'、'.join(removed.get('addresses', []))}"
             )
+            self._sync_host_allow()
 
     # ---- 启动 / 停止 ----
     def probe_host(self) -> None:
@@ -1773,12 +2278,10 @@ class MainWindow(QMainWindow):
         entries = relay.allow_entries_from_codes(
             relay.load_join_codes(), self._session
         )
-        if not entries:
-            return None, (
-                "白名单为空：请先把加入方发来的 JOIN… 码添加到列表并启用，"
-                "否则任何人扫到端口都能连。"
-            )
-        allow = relay.AddressAllowList(entries)
+        # 空白名单不再阻拦启动：先用「拒绝所有人」守门（端口/防火墙/探测都正常，
+        # 只是外部加入会被拒）。添加加入码后由 _sync_host_allow 即时放行，
+        # 不用重启中继。
+        allow = relay.AddressAllowList(entries, closed=not entries)
         rules = []
         for i, port in enumerate(sorted(ports)):
             rules.append(relay.ForwardRule(
@@ -1817,22 +2320,34 @@ class MainWindow(QMainWindow):
             )
 
     def _after_relay_started(self) -> None:
-        if not self.rb_host.isChecked() and self._host_info:
-            # 加入方：生成游戏内连接指令。
-            # 必须连**主世界**端口（主机在主机码里告知），不能取最小端口 ——
-            # DST 默认主世界 10999、洞穴 10998，连洞穴端口进不去。
-            master = self._host_info["master_port"]
-            cmd = config.join_command("127.0.0.1", master)
-            self.join_cmd_view.setText(cmd)
-            self.btn_join_cmd_copy.setEnabled(True)
-            local_ports = "、".join(
-                str(g) for _, g in sorted(self._host_info["maps"], key=lambda m: m[1])
-            )
-            self.join_status_label.setText(
-                f"已连接主机的 {len(self._host_info['maps'])} 条映射"
-                f"（本地监听 {local_ports}，主世界 {master}）；"
-                "在饥荒控制台粘贴上面指令即可加入"
-            )
+        if self.rb_host.isChecked():
+            # 主机端：空白名单也能先启动（closed 守门）；这里把当前状态说清楚
+            thread = self.relay_thread
+            allow = (thread.relay.rules[0].allow
+                     if thread is not None and thread.relay is not None
+                     and thread.relay.rules else None)
+            if allow is not None and allow.is_closed:
+                self._append_relay_log(
+                    "[INFO] 还没有生效的加入码：中继已启动，所有外部加入会被拒绝；"
+                    "添加加入码后**立即生效**（无需重启中继）")
+            return
+        if not self._host_info:
+            return
+        # 加入方：生成游戏内连接指令。
+        # 必须连**主世界**端口（主机在主机码里告知），不能取最小端口 ——
+        # DST 默认主世界 10999、洞穴 10998，连洞穴端口进不去。
+        master = self._host_info["master_port"]
+        cmd = config.join_command("127.0.0.1", master)
+        self.join_cmd_view.setText(cmd)
+        self.btn_join_cmd_copy.setEnabled(True)
+        local_ports = "、".join(
+            str(g) for _, g in sorted(self._host_info["maps"], key=lambda m: m[1])
+        )
+        self.join_status_label.setText(
+            f"已连接主机的 {len(self._host_info['maps'])} 条映射"
+            f"（本地监听 {local_ports}，主世界 {master}）；"
+            "在饥荒控制台粘贴上面指令即可加入"
+        )
 
     def stop_relay(self) -> None:
         thread = self.relay_thread
@@ -1881,6 +2396,13 @@ class MainWindow(QMainWindow):
         elif kind == "busy":
             target.setText(
                 f"已达最大并发，忽略 {payload.get('remote', '?')}")
+
+    def apply_host_rules(self) -> None:
+        """中继已运行时点「确认生效」：不重启，只把白名单热更新进去。"""
+        if self.rb_host.isChecked():
+            self._sync_host_allow()
+            return
+        self.apply_and_start()
 
     def _append_relay_log(self, message: str) -> None:
         if not message:
@@ -2165,16 +2687,7 @@ class MainWindow(QMainWindow):
         self._set_status(level_text)
         self.btn_copy_share.setEnabled(True)
 
-        if report.is_admin:
-            self.admin_badge.setText("● 管理员模式")
-            self.admin_badge.setProperty("admin", "1")
-        else:
-            self.admin_badge.setText("● 普通权限")
-            self.admin_badge.setProperty("admin", "0")
-        # 触发样式刷新
-        self.admin_badge.style().unpolish(self.admin_badge)
-        self.admin_badge.style().polish(self.admin_badge)
-        self.admin_badge.setVisible(True)
+        self._refresh_admin_badge(report.is_admin)
 
         if self.autocopy.isChecked() and report.connect_command:
             self.copy_command(quiet=True)

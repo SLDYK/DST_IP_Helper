@@ -117,6 +117,12 @@ class DstIpJoinApp:
 
         self.admin_badge = tk.Label(header, text="", font=(FONT_FAMILY, 9))
         self.admin_badge.pack(side="right")
+        # 徽标原先只在检测完成回调里显示；启动不再自动检测后会一直空着，
+        # 改成搭界面时就显示（winproc.is_admin 是纯本地轻量调用）。
+        if winproc.is_admin():
+            self.admin_badge.configure(text="● 管理员模式", fg="#1a7f37")
+        else:
+            self.admin_badge.configure(text="● 普通权限", fg="#9a6700")
 
     def _build_checks(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text=" 检测项 ", padding=8)
