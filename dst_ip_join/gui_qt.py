@@ -2407,8 +2407,16 @@ class MainWindow(QMainWindow):
                 f"已达最大并发，忽略 {payload.get('remote', '?')}")
 
     def apply_host_rules(self) -> None:
-        """中继已运行时点「确认生效」：不重启，只把白名单热更新进去。"""
-        if self.rb_host.isChecked():
+        """主机端「确认生效并启动中继」按钮。
+
+        未启动：走原启动流程（绑定端口、放行防火墙并启动中继）；
+        已启动：不重启，只把当前加入码白名单热更新进去。
+        回归（2026-09-24）：此前主机端无条件只做热更新，而中继还没启动时
+        ``_sync_host_allow`` 发现线程为空会静默返回，按钮点了毫无反应。
+        """
+        thread = self.relay_thread
+        if (self.rb_host.isChecked()
+                and thread is not None and thread.isRunning()):
             self._sync_host_allow()
             return
         self.apply_and_start()

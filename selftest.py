@@ -454,6 +454,32 @@ else:
               _qt_win.quick_cmd_buttons["pause"].text() == "暂停世界",
               _qt_win.quick_cmd_buttons["pause"].text())
 
+        # 回归（2026-09-24）：中继未启动时点「确认生效并启动中继」必须真的启动，
+        # 不能被「已运行只热更新」分支静默吞掉（表现为按钮点了毫无反应）。
+        # 全程打桩：detect_dst_ports 提供端口、add_udp_rule 免 netsh、换基础端口。
+        _orig_detect = relay.detect_dst_ports
+        _orig_add_udp = gui_qt.firewall.add_udp_rule
+        _orig_base = relay.DEFAULT_RELAY_BASE
+        relay.detect_dst_ports = lambda: [10998, 10999]
+        gui_qt.firewall.add_udp_rule = lambda port: (True, "测试桩")
+        relay.DEFAULT_RELAY_BASE = 23456
+        _apply_thread = None
+        try:
+            _qt_win.apply_host_rules()
+            _apply_thread = _qt_win.relay_thread
+            check("中继未启动时点「确认生效」会真正启动中继",
+                  _apply_thread is not None and _apply_thread.isRunning())
+            _qt_win.apply_host_rules()
+            check("已启动再点「确认生效」不重启中继（只热更新白名单）",
+                  _qt_win.relay_thread is _apply_thread)
+        finally:
+            relay.detect_dst_ports = _orig_detect
+            gui_qt.firewall.add_udp_rule = _orig_add_udp
+            relay.DEFAULT_RELAY_BASE = _orig_base
+            if _apply_thread is not None:
+                _apply_thread.stop()
+                _apply_thread.wait(3000)
+
         _qt_win.close()
         check("PyQt6 中继窗口能干净关闭", True)
     except Exception as exc:  # noqa: BLE001
